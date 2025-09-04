@@ -159,20 +159,15 @@ function fallbackRoi(W,H){ const y0=H*0.45,y1=y0+Math.max(8,H*0.03),x0=W*0.30,x1
 
 /* Palpebral conjunctival strip just under the lower eyelid, thin & curved */
 function palpebralStripThin(lm, W, H, useRightEye=true){
-  // lower-lid landmark sets (MediaPipe indices)
   const lowerRight = [145,153,154,155,133,173,157,158,159];
   const lowerLeft  = [374,380,381,382,362,398,384,385,386];
   const ids = useRightEye ? lowerRight : lowerLeft;
   const pts = ids.map(i => ({ x: lm[i].x*W, y: lm[i].y*H }));
-  // eye width for scale
   const cornerR = useRightEye ? 33 : 263;
   const cornerL = useRightEye ? 133 : 362;
   const wEye = Math.hypot(lm[cornerR].x*W - lm[cornerL].x*W, lm[cornerR].y*H - lm[cornerL].y*H);
-  // strip thickness: ~2.5% of eye width, min 4 px
   const thickness = Math.max(4, Math.round(0.025 * wEye));
-  // offset downward in image coordinates (approx; robust & fast)
   const down = pts.map(p => ({ x: p.x, y: p.y + thickness }));
-  // closed thin strip polygon (lid forward + offset backward)
   return [...pts, ...down.reverse()];
 }
 
@@ -236,7 +231,7 @@ function boxBlur(gray, w, h, r=3){
   }} return out;
 }
 
-/* Conjunctiva-like pixel mask inside ROI to remove sclera/lashes/skin */
+/* Conjunctiva-like pixel mask inside ROI */
 function conjunctivaMask(imageData, roiPoly){
   const {width:W,height:H,data}=imageData;
   const bb=polyBBox(roiPoly);
@@ -247,34 +242,24 @@ function conjunctivaMask(imageData, roiPoly){
   for(let y=y0;y<=y1;y++){ for(let x=x0;x<=x1;x++){
     const idx=(y*W+x)*4; const r=data[idx], g=data[idx+1], b=data[idx+2];
     if(!pointInPoly(x,y,roiPoly)) continue;
-
-    // Convert to HSV-lite: approximate saturation & value
     const maxv = Math.max(r,g,b), minv = Math.min(r,g,b);
     const V = maxv; const S = maxv ? (maxv - minv)/maxv : 0;
-
-    // Heuristics:
-    // - exclude very bright & low saturation (sclera glare): V>240 && S<0.12
-    // - exclude very dark (lashes): V<35
-    // - prefer pinkish/red tissue: r>=g && g>=b (loose) and S between 0.10..0.65 and V between 50..230
     const isSclera = (V>240 && S<0.12);
     const isLash   = (V<35);
     const looksConj = (!isSclera && !isLash && r>=g && g>=b && S>=0.10 && S<=0.65 && V>=50 && V<=230);
-
     mask[(y-y0)*outW + (x-x0)] = looksConj ? 1 : 0;
   }} return {mask, x0, y0, w:outW, h:outH};
 }
 
-/* Extract ROI crop of GREEN channel, applying conjunctiva mask */
+/* Extract masked GREEN in ROI */
 function extractGreenConj(imageData, roiPoly, outW=240, outH=160){
   const {width:W,height:H,data} = imageData;
   const bb=polyBBox(roiPoly);
   const x0=Math.max(0,Math.floor(bb.minX)), y0=Math.max(0,Math.floor(bb.minY));
   const x1=Math.min(W-1,Math.ceil(bb.maxX)), y1=Math.min(H-1,Math.ceil(bb.maxY));
   const roiW=x1-x0+1, roiH=y1-y0+1;
-
   const {mask:m2, x0:mx0, y0:my0, w:mw, h:mh} = conjunctivaMask(imageData, roiPoly);
   const g=new Float32Array(outW*outH), mask=new Uint8Array(outW*outH);
-
   for(let j=0;j<outH;j++){
     const sy=y0 + Math.floor(j*roiH/outH);
     for(let i=0;i<outW;i++){
@@ -282,13 +267,13 @@ function extractGreenConj(imageData, roiPoly, outW=240, outH=160){
       const idx=(sy*W+sx)*4;
       const mVal = (sx>=mx0 && sx<mx0+mw && sy>=my0 && sy<my0+mh) ? m2[(sy-my0)*mw + (sx-mx0)] : 0;
       mask[j*outW+i] = mVal ? 1 : 0;
-      g[j*outW+i] = mVal ? data[idx+1] : 0; // green only where mask=1
+      g[j*outW+i] = mVal ? data[idx+1] : 0; // green
     }
   }
   return {g,w:outW,h:outH,mask};
 }
 
-/* Vesselness via top-hat (masked), normalized to [0,255] */
+/* Vesselness via top-hat (masked) */
 function vesselnessTopHatMasked(g,w,h,mask,blurR=3){
   const blurred = boxBlur(g,w,h,blurR);
   const raw=new Float32Array(w*h); let maxv=1e-6;
@@ -319,7 +304,7 @@ function analyzeRppg(times, vals){
   let x=detrend(xs, Math.round(fs*0.8)); const win=hamming(x.length); for(let i=0;i<x.length;i++) x[i]*=win[i];
   const mean = xs.reduce((a,b)=>a+b,0)/xs.length; const sd = Math.sqrt(x.reduce((a,b)=>a+b*b,0)/x.length);
   const acdc = mean>0 ? (sd/mean) : null;
-  const fmin=0.8,fmax=3.5,step=0.02; const freqs=[]; for(let f=fmin;f<=fmax;f+=step) freqs.push(f);
+  const fmin=0.8,fmax=3.5,step=0.02; const freqs=[]; for(let f=fmin; f<=fmax; f+=step) freqs.push(f);
   const P=periodogramDFT(x,fs,freqs); let iMax=0; for(let i=1;i<P.length;i++) if(P[i]>P[iMax]) iMax=i;
   const fPeak=freqs[iMax]; const hr=Math.round(fPeak*60);
   const side=[]; for(let i=0;i<P.length;i++){ if(Math.abs(freqs[i]-fPeak)>0.06 && Math.abs(freqs[i]-fPeak)<0.5) side.push(P[i]); }
@@ -351,7 +336,6 @@ function computeMetricsAndUpdateUI(){
     roiFrac = area(roiPoly)/(overlay.width*overlay.height);
   }
 
-  // live pallor features (masked pallor below, for now keep mean RGB for reference)
   if (rgb.n>0){
     ui.pR.textContent = rgb.r.toFixed(0);
     ui.pG.textContent = rgb.g.toFixed(0);
@@ -371,7 +355,6 @@ function computeMetricsAndUpdateUI(){
   ui.roi.textContent    = (roiFrac*100).toFixed(2)+"%"; setClass(ui.roi, roiOk);
   ui.status.textContent = pass ? "PASS" : "Adjust aim / light / stability"; setClass(ui.status, pass);
 
-  // rPPG stream (unmasked green mean for stability); for a stricter variant we can apply the conjunctiva mask here too.
   const now = performance.now()/1000;
   if (rgb.n>0){
     greenSeries.push(rgb.g); sampleTimes.push(now);
@@ -379,12 +362,10 @@ function computeMetricsAndUpdateUI(){
     plotSeries(greenSeries);
   }
 
-  // Accumulate ROI view + vesselness during recording with conjunctiva-only mask
   if (recording && roiPoly){
     const crop = extractGreenConj(frame, roiPoly, roiCanvas.width, roiCanvas.height);
     const enh  = vesselnessTopHatMasked(crop.g, crop.w, crop.h, crop.mask, 3);
 
-    // ROI view (masked G as grayscale)
     const roiImg = roiCtx.createImageData(crop.w, crop.h);
     for (let i=0;i<crop.w*crop.h;i++){
       const v = crop.mask[i] ? Math.round(crop.g[i]) : 0;
@@ -392,7 +373,6 @@ function computeMetricsAndUpdateUI(){
     }
     roiCtx.putImageData(roiImg, 0, 0);
 
-    // Accumulate vesselness
     if (!vesselSum) vesselSum = new Float32Array(crop.w*crop.h);
     for (let i=0;i<enh.length;i++) vesselSum[i] += enh[i];
     vesselCount++;
@@ -444,8 +424,9 @@ function stop(){ running=false; stopCamera(); cancelCountdown(); ui.recStatus.te
 function startRecording(){
   if(!running || recording) return;
   recording=true; recordStart=performance.now()/1000; ui.btnRecord.disabled=true;
-  vesselSum=null; vesselCount=0; roiCtx.clearRect(0,0,roiCanvas.width,roiCanvas.height); vesselCtx.clearRect(0,0,vesselCanvas.width, vesse
-lCanvas.height);
+  vesselSum=null; vesselCount=0;
+  roiCtx.clearRect(0,0,roiCanvas.width,roiCanvas.height);
+  vesselCtx.clearRect(0,0,vesselCanvas.width,vesselCanvas.height); /* <-- fixed line */
   let left=10.0; ui.recStatus.textContent=`Recording: ${left.toFixed(1)}s`;
   recTimer=setInterval(()=>{
     left = Math.max(0, 10 - (performance.now()/1000 - recordStart));
@@ -457,7 +438,6 @@ function cancelCountdown(){ if(recTimer){ clearInterval(recTimer); recTimer=null
 function stopRecordingAndAnalyze(){
   cancelCountdown(); recording=false; ui.recStatus.textContent="Analyzing…";
 
-  // rPPG (last ~10s)
   const now = sampleTimes.length? sampleTimes[sampleTimes.length-1] : 0;
   const idx = sampleTimes.findIndex(t => t>= now-10);
   const times = idx>=0 ? sampleTimes.slice(idx) : sampleTimes.slice();
@@ -467,7 +447,6 @@ function stopRecordingAndAnalyze(){
   ui.rACDC.textContent = res.acdc ? res.acdc : "—";
   ui.rSNR.textContent  = res.snr  ? res.snr  : "—";
 
-  // Vesselness avg rendering
   if (vesselSum && vesselCount>0){
     const avg = new Uint8ClampedArray(vesselSum.length);
     let maxv=1e-6; for(let i=0;i<vesselSum.length;i++) if(vesselSum[i]>maxv) maxv=vesselSum[i];
