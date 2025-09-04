@@ -10,6 +10,8 @@
   .wrap{padding:12px;display:flex;flex-direction:column;gap:12px;max-width:720px;margin:0 auto}
   .stack{position:relative}
   video,canvas{width:100%;border-radius:12px;background:#000}
+  /* Hide raw <video>, we draw everything to <canvas> to avoid the “two camera windows” look */
+  #video{display:none}
   .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:10px}
   .row{display:flex;flex-wrap:wrap;gap:10px}
   .metric{flex:1 1 30%;min-width:120px}
@@ -27,7 +29,7 @@
 <body>
 <div class="wrap">
   <h2>Conjunctival ROI • Pallor + rPPG Demo</h2>
-  <div class="hint">Open in <b>Safari on iPhone</b>, allow camera. Choose Rear/Selfie, then Start. HTTPS is required (Netlify / GitHub Pages).</div>
+  <div class="hint">Open in <b>Safari on iPhone</b>, allow camera. Choose Rear/Selfie, then Start. HTTPS is required (GitHub Pages).</div>
 
   <div class="controls card">
     <div class="pill">
@@ -75,21 +77,37 @@
   </div>
 
   <div class="card">
+    <div class="row">
+      <div class="metric"><h4>ROI View (10-s)</h4></div>
+      <div class="metric"><h4>Vesselness (10-s avg)</h4></div>
+    </div>
+    <div class="row">
+      <canvas id="roiView" width="240" height="160" class="plot"></canvas>
+      <canvas id="vesselView" width="240" height="160" class="plot"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
     <b>Debug:</b> <span id="debug" class="hint">Ready.</span>
   </div>
 
-  <div class="hint">If ROI isn’t found, the app falls back to a center band under the eye so you can still record and analyze.</div>
+  <div class="hint">If the eye isn’t found, the app uses a center band so you can still record and analyze.</div>
 </div>
 
 <!-- MediaPipe FaceMesh (CDN) -->
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.min.js"></script>
 
 <script>
+/* ---------- Elements ---------- */
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay');
 const ctx = overlay.getContext('2d');
 const plot = document.getElementById('plot');
 const pctx = plot.getContext('2d');
+const roiCanvas = document.getElementById('roiView');
+const vesselCanvas = document.getElementById('vesselView');
+const roiCtx = roiCanvas.getContext('2d');
+const vesselCtx = vesselCanvas.getContext('2d');
 const dbg = document.getElementById('debug');
 
 const ui = {
@@ -98,91 +116,49 @@ const ui = {
   glare: document.getElementById('mGlare'),
   roi: document.getElementById('mRoi'),
   status: document.getElementById('mStatus'),
-  pR: document.getElementById('pR'),
-  pG: document.getElementById('pG'),
-  pB: document.getElementById('pB'),
-  pRG: document.getElementById('pRG'),
-  rHR: document.getElementById('rHR'),
-  rACDC: document.getElementById('rACDC'),
-  rSNR: document.getElementById('rSNR'),
-  btnStart: document.getElementById('btnStart'),
-  btnStop: document.getElementById('btnStop'),
-  btnRecord: document.getElementById('btnRecord'),
+  pR: document.getElementById('pR'), pG: document.getElementById('pG'), pB: document.getElementById('pB'), pRG: document.getElementById('pRG'),
+  rHR: document.getElementById('rHR'), rACDC: document.getElementById('rACDC'), rSNR: document.getElementById('rSNR'),
+  btnStart: document.getElementById('btnStart'), btnStop: document.getElementById('btnStop'), btnRecord: document.getElementById('btnRecord'),
   recStatus: document.getElementById('recStatus'),
 };
 
-function logDebug(msg, isError=false){
-  dbg.textContent = msg;
-  dbg.className = isError ? 'bad' : 'hint';
-}
-
-// camera choice (rear/selfie)
+/* ---------- Utils ---------- */
+function logDebug(msg, isError=false){ dbg.textContent = msg; dbg.className = isError ? 'bad' : 'hint'; }
 function selectedFacingMode(){
   const radios = document.querySelectorAll('input[name="cam"]');
   for (const r of radios) if (r.checked) return r.value;
   return "environment";
 }
-
-// Thresholds (tune as needed)
-const TH = { minVarLap: 80.0, maxMotion: 0.08, maxGlare: 0.10, minRoiFrac: 0.12 };
-
-let running = false;
-let faceMesh;
-let faceMeshReady = false;
-let lastGraySmall = null;
-let roiPoly = null;
-let greenSeries = [];
-let sampleTimes = [];
-const MAX_SERIES = 600;  // ~20s @30fps
-
-// recording state
-let recording = false;
-let recordStart = 0;
-let recTimer = null;
-
-// UI helpers
 function setClass(el, ok){ el.className = 'val ' + (ok ? 'ok':'warn'); }
+function resizeCanvases(){ overlay.width = video.videoWidth || 1280; overlay.height = video.videoHeight || 720; plot.width = overlay.width; plot.height = 120; }
 
-function resizeCanvases() {
-  overlay.width = video.videoWidth || 1280;
-  overlay.height = video.videoHeight || 720;
-  plot.width = overlay.width;
-  plot.height = 120;
-}
+/* Thresholds */
+const TH = { minVarLap: 80.0, maxMotion: 0.08, maxGlare: 0.10, minRoiFrac: 0.08 };
 
-// Start/Stop camera
-async function startCamera() {
-  try {
+/* State */
+let running=false, faceMesh, faceMeshReady=false, roiPoly=null;
+let lastGraySmall=null, greenSeries=[], sampleTimes=[];
+let vesselSum=null, vesselCount=0; // accumulation for vesselness over 10s
+const MAX_SERIES=600; // ~20s @30fps
+let recording=false, recordStart=0, recTimer=null;
+
+/* ---------- Camera ---------- */
+async function startCamera(){
+  try{
     const mode = selectedFacingMode();
-    const constraints = {
+    const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: mode }, width: { ideal: 1280 }, height: { ideal: 720 } },
       audio: false
-    };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-    video.srcObject = stream;
-    return new Promise(res => {
-      video.onloadedmetadata = () => { video.play(); resizeCanvases(); res(); };
     });
-  } catch (e) {
-    logDebug('Camera error: ' + e.message, true);
-    throw e;
-  }
+    video.srcObject = stream;
+    return new Promise(res => { video.onloadedmetadata = () => { video.play(); resizeCanvases(); res(); }; });
+  } catch(e){ logDebug('Camera error: ' + e.message, true); throw e; }
+}
+function stopCamera(){
+  const s = video.srcObject; if (s) s.getTracks().forEach(t=>t.stop()); video.srcObject = null;
 }
 
-// Fallback ROI (center band)
-function fallbackRoi(W,H){
-  const y0 = H*0.40, y1 = H*0.60, x0 = W*0.20, x1 = W*0.80;
-  return [{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}];
-}
-
-// Geometry helpers
-function drawPoly(poly, color='rgba(255,255,0,0.8)'){
-  if (!poly || poly.length===0) return;
-  ctx.save(); ctx.strokeStyle=color; ctx.lineWidth=2;
-  ctx.beginPath(); ctx.moveTo(poly[0].x, poly[0].y);
-  for (let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x, poly[i].y);
-  ctx.closePath(); ctx.stroke(); ctx.restore();
-}
+/* ---------- Geometry/ROI ---------- */
 function polyBBox(poly){ let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
   for(const p of poly){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; }
   return {minX,minY,maxX,maxY};
@@ -196,8 +172,24 @@ function pointInPoly(x,y,poly){
   }
   return inside;
 }
+function fallbackRoi(W,H){ const y0=H*0.40,y1=H*0.60,x0=W*0.20,x1=W*0.80; return [{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}]; }
+function drawPolyFilled(poly, stroke='rgba(255,255,0,0.9)', fill='rgba(255,255,0,0.18)'){
+  if (!poly || poly.length===0) return;
+  ctx.save(); ctx.fillStyle=fill; ctx.strokeStyle=stroke; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(poly[0].x, poly[0].y);
+  for (let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x, poly[i].y);
+  ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+}
+/* Palpebral conjunctiva strip just under the lower eyelid */
+function palpebralStrip(lm, W, H, useRightEye=true){
+  const ids = useRightEye ? [145,153,154,155,133,173,157,158,159] : [374,380,381,382,362,398,384,385,386];
+  const pts = ids.map(i => ({ x: lm[i].x*W, y: lm[i].y*H }));
+  const offset = Math.max(4, Math.round(W * 0.005)); // ~0.5% width
+  const down = pts.map(p => ({ x: p.x, y: p.y + offset }));
+  return [...pts, ...down.reverse()];
+}
 
-// Image helpers
+/* ---------- Image ops ---------- */
 function toGraySmall(imageData, w, h, outW=160, outH=120){
   const gray=new Uint8ClampedArray(outW*outH), data=imageData.data;
   for(let j=0;j<outH;j++){
@@ -216,9 +208,7 @@ function varianceOfLaplacian(gray,w,h){
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
       let conv=0, idxK=0;
-      for(let dy=-1;dy<=1;dy++)
-        for(let dx=-1;dx<=1;dx++)
-          conv += gray[(y+dy)*w+(x+dx)]*k[idxK++];
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++) conv += gray[(y+dy)*w+(x+dx)]*k[idxK++];
       sum+=conv; sumSq+=conv*conv; n++;
     }
   }
@@ -258,37 +248,71 @@ function meanRGB(imageData, poly){
 }
 function area(poly){ const bb=polyBBox(poly); return Math.max(0,(bb.maxX-bb.minX))*Math.max(0,(bb.maxY-bb.minY)); }
 
-// Build band under lower eyelid (right eye) using FaceMesh indices
-function lowerEyelidBand(lm, W, H, rightEye=true){
-  // Robust to landmark variants: try both eyes; default to right if available
-  const sets = [
-    [33, 159, 145, 133], // right-ish
-    [263, 386, 374, 362] // left-ish
-  ];
-  const ids = rightEye ? sets[0] : sets[1];
-  const pts = ids.map(i => ({ x: lm[i].x*W, y: lm[i].y*H }));
-  const left=pts[0], lower=pts[2], right=pts[3];
-  const pad=Math.max(10,Math.abs(right.x-left.x)*0.1);
-  const x0=Math.min(left.x,right.x)-pad, x1=Math.max(left.x,right.x)+pad;
-  const y0=lower.y+4, bandH=Math.max(10, (right.y+left.y+lower.y)/3 - lower.y + 12);
-  const y1=y0+bandH;
-  return [{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}];
+/* Fast separable box blur (approx Gaussian) for small grayscale images */
+function boxBlur(gray, w, h, r=3){
+  const tmp=new Float32Array(w*h), out=new Float32Array(w*h);
+  // horizontal
+  for(let y=0;y<h;y++){
+    let sum=0;
+    for(let x=0;x<w;x++){
+      const x0=Math.max(0,x-r), x1=Math.min(w-1,x+r);
+      if (x===0){ sum=0; for(let i=x0;i<=x1;i++) sum+=gray[y*w+i]; }
+      else { const prev=Math.max(0,x-1-r), next=Math.min(w-1,x+r); sum += gray[y*w+next] - gray[y*w+prev]; }
+      tmp[y*w+x] = sum / (x1-x0+1);
+    }
+  }
+  // vertical
+  for(let x=0;x<w;x++){
+    let sum=0;
+    for(let y=0;y<h;y++){
+      const y0=Math.max(0,y-r), y1=Math.min(h-1,y+r);
+      if (y===0){ sum=0; for(let j=y0;j<=y1;j++) sum+=tmp[j*w+x]; }
+      else { const prev=Math.max(0,y-1-r), next=Math.min(h-1,y+r); sum += tmp[next*w+x] - tmp[prev*w+x]; }
+      out[y*w+x] = sum / (y1-y0+1);
+    }
+  }
+  return out;
+}
+/* Extract ROI crop of GREEN channel */
+function extractGreenInRoi(imageData, roiPoly, outW=240, outH=160){
+  const {width:W,height:H,data} = imageData;
+  const bb = polyBBox(roiPoly);
+  const x0=Math.floor(Math.max(0,bb.minX)), y0=Math.floor(Math.max(0,bb.minY));
+  const x1=Math.floor(Math.min(W-1,bb.maxX)), y1=Math.floor(Math.min(H-1,bb.maxY));
+  const roiW=Math.max(1,x1-x0+1), roiH=Math.max(1,y1-y0+1);
+  const g=new Float32Array(outW*outH), mask=new Uint8Array(outW*outH);
+  for(let j=0;j<outH;j++){
+    const sy=y0 + Math.floor(j*roiH/outH);
+    for(let i=0;i<outW;i++){
+      const sx=x0 + Math.floor(i*roiW/outW);
+      const idx=(sy*W+sx)*4; const inside=pointInPoly(sx,sy,roiPoly);
+      mask[j*outW+i]=inside?1:0; g[j*outW+i]=data[idx+1]; // G
+    }
+  }
+  return {g,w:outW,h:outH,mask};
+}
+/* Vesselness via top-hat: G - blur(G) (masked), normalized to [0,255] */
+function vesselnessTopHat(g,w,h,mask,blurR=3){
+  const blurred = boxBlur(g,w,h,blurR);
+  const raw=new Float32Array(w*h);
+  let maxv=1e-6;
+  for(let i=0;i<w*h;i++){ const v=Math.max(0, g[i]-blurred[i])*(mask[i]?1:0); raw[i]=v; if(v>maxv) maxv=v; }
+  const out=new Uint8ClampedArray(w*h);
+  for(let i=0;i<w*h;i++) out[i]=Math.round(255*(raw[i]/maxv));
+  return out;
 }
 
-// simple line plot
+/* ---------- rPPG utilities ---------- */
 function plotSeries(series){
-  const w=plot.width, h=plot.height; pctx.clearRect(0,0,w,h);
+  const w=plot.width,h=plot.height; pctx.clearRect(0,0,w,h);
   if(series.length<2) return;
   const maxV=Math.max(...series), minV=Math.min(...series), rng=Math.max(1e-3,maxV-minV);
   pctx.strokeStyle="#7ef5d6"; pctx.lineWidth=2; pctx.beginPath();
   for(let i=0;i<series.length;i++){
-    const x=i*(w/(series.length-1));
-    const y=h-((series[i]-minV)/rng)*h;
+    const x=i*(w/(series.length-1)); const y=h-((series[i]-minV)/rng)*h;
     if(i===0) pctx.moveTo(x,y); else pctx.lineTo(x,y);
   } pctx.stroke();
 }
-
-// detrend via moving average
 function detrend(arr, win=21){
   const out=new Array(arr.length).fill(0);
   for(let i=0;i<arr.length;i++){
@@ -298,92 +322,46 @@ function detrend(arr, win=21){
   } return out;
 }
 function hamming(N){ const w=new Array(N); for(let n=0;n<N;n++) w[n]=0.54-0.46*Math.cos(2*Math.PI*n/(N-1)); return w; }
-// naive DFT power at specific frequencies
 function periodogramDFT(x, fs, freqList){
   const N=x.length, pow=new Array(freqList.length).fill(0);
   for(let k=0;k<freqList.length;k++){
-    const f=freqList[k], w=2*Math.PI*f/fs; let real=0, imag=0;
-    for(let n=0;n<N;n++){ const phi=w*n; real+=x[n]*Math.cos(phi); imag-=x[n]*Math.sin(phi); }
-    pow[k]= (real*real+imag*imag)/N;
+    const f=freqList[k], w=2*Math.PI*f/fs; let re=0, im=0;
+    for(let n=0;n<N;n++){ const phi=w*n; re+=x[n]*Math.cos(phi); im-=x[n]*Math.sin(phi); }
+    pow[k]=(re*re+im*im)/N;
   } return pow;
 }
-
-// rPPG features from last ~10 s
 function analyzeRppg(times, vals){
   if (times.length<50) return {hr:null, acdc:null, snr:null};
   const dur=Math.max(0.1, times[times.length-1]-times[0]);
   const fs=25, M=Math.max(64, Math.min(256, Math.round(dur*fs)));
   const t0=times[0], tStep=dur/(M-1);
   const xs=new Array(M);
-  for(let i=0;i<M;i++){
-    const t=t0+i*tStep;
-    let j=0; while(j<times.length-1 && times[j]<t) j++;
-    xs[i]=vals[Math.max(0, Math.min(times.length-1, j))];
-  }
-  let x=detrend(xs, Math.round(fs*0.8));
-  const win=hamming(x.length); for(let i=0;i<x.length;i++) x[i]*=win[i];
-
-  const mean = xs.reduce((a,b)=>a+b,0)/xs.length;
-  const sd = Math.sqrt(x.reduce((a,b)=>a+b*b,0)/x.length);
+  for(let i=0;i<M;i++){ const t=t0+i*tStep; let j=0; while(j<times.length-1 && times[j]<t) j++; xs[i]=vals[Math.max(0,Math.min(times.length-1,j))]; }
+  let x=detrend(xs, Math.round(fs*0.8)); const win=hamming(x.length); for(let i=0;i<x.length;i++) x[i]*=win[i];
+  const mean = xs.reduce((a,b)=>a+b,0)/xs.length; const sd=Math.sqrt(x.reduce((a,b)=>a+b*b,0)/x.length);
   const acdc = mean>0 ? (sd/mean) : null;
-
-  const fmin=0.8, fmax=3.5, step=0.02;
-  const freqs=[]; for(let f=fmin; f<=fmax; f+=step) freqs.push(f);
-  const P=periodogramDFT(x, fs, freqs);
-  let iMax=0; for(let i=1;i<P.length;i++) if(P[i]>P[iMax]) iMax=i;
+  const fmin=0.8,fmax=3.5,step=0.02; const freqs=[]; for(let f=fmin;f<=fmax;f+=step) freqs.push(f);
+  const P=periodogramDFT(x,fs,freqs); let iMax=0; for(let i=1;i<P.length;i++) if(P[i]>P[iMax]) iMax=i;
   const fPeak=freqs[iMax]; const hr=Math.round(fPeak*60);
-  const side=[]; for(let i=0;i<P.length;i++){
-    if(Math.abs(freqs[i]-fPeak)>0.06 && Math.abs(freqs[i]-fPeak)<0.5) side.push(P[i]);
-  }
+  const side=[]; for(let i=0;i<P.length;i++){ if(Math.abs(freqs[i]-fPeak)>0.06 && Math.abs(freqs[i]-fPeak)<0.5) side.push(P[i]); }
   const median = side.length? side.slice().sort((a,b)=>a-b)[Math.floor(side.length/2)] : 1e-6;
-  const snr = (P[iMax]/Math.max(1e-6,median)).toFixed(2);
-
+  const snr=(P[iMax]/Math.max(1e-6,median)).toFixed(2);
   return {hr, acdc: acdc ? acdc.toFixed(4):null, snr};
 }
 
-// FaceMesh init
+/* ---------- FaceMesh ---------- */
 async function initFaceMesh(){
   faceMesh = new FaceMesh.FaceMesh({ locateFile: (f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
   faceMesh.setOptions({ maxNumFaces:1, refineLandmarks:true, minDetectionConfidence:0.5, minTrackingConfidence:0.5 });
   faceMesh.onResults(onResults);
-  faceMeshReady = true;
-  logDebug('FaceMesh initialized.');
+  faceMeshReady=true; logDebug('FaceMesh initialized.');
+}
+function buildRoiFromLandmarks(lm,W,H){
+  try { return palpebralStrip(lm,W,H,true); }
+  catch(e){ return fallbackRoi(W,H); }
 }
 
-// ROI from FaceMesh (band under lower eyelid); if fail -> fallback
-function buildRoiFromLandmarks(lm, W, H){
-  try {
-    const band = lowerEyelidBand(lm, W, H, true);
-    return band;
-  } catch(e){
-    return fallbackRoi(W,H);
-  }
-}
-
-// Main results callback
-function onResults(res){
-  if(!running) return;
-  ctx.save();
-  // Mirror for selfie for intuitive aiming
-  if (selectedFacingMode()==="user") { ctx.translate(overlay.width, 0); ctx.scale(-1, 1); }
-  ctx.drawImage(res.image,0,0,overlay.width,overlay.height);
-
-  // ROI
-  roiPoly = null;
-  if (res.multiFaceLandmarks && res.multiFaceLandmarks.length>0) {
-    roiPoly = buildRoiFromLandmarks(res.multiFaceLandmarks[0], overlay.width, overlay.height);
-    drawPoly(roiPoly);
-  } else {
-    // no face detected → fallback band so user can still record & analyze
-    roiPoly = fallbackRoi(overlay.width, overlay.height);
-    drawPoly(roiPoly, 'rgba(0,200,255,0.8)');
-  }
-  ctx.restore();
-
-  computeMetricsAndUpdateUI();
-}
-
-// Compute metrics per frame and update visuals
+/* ---------- Frame processing ---------- */
 function computeMetricsAndUpdateUI(){
   const frame = ctx.getImageData(0,0,overlay.width,overlay.height);
   const {gray,outW,outH} = toGraySmall(frame, overlay.width, overlay.height);
@@ -406,7 +384,7 @@ function computeMetricsAndUpdateUI(){
     ui.pRG.textContent = (rgb.g>0 ? (rgb.r/rgb.g).toFixed(3) : "—");
   }
 
-  // quality gates
+  // quality
   const focusOk = varLap>=TH.minVarLap;
   const motionOk = motion<=TH.maxMotion || !lastGraySmall;
   const glareOk = glare<=TH.maxGlare;
@@ -419,92 +397,123 @@ function computeMetricsAndUpdateUI(){
   ui.roi.textContent    = (roiFrac*100).toFixed(1)+"%"; setClass(ui.roi, roiOk);
   ui.status.textContent = pass ? "PASS" : "Adjust aim / light / stability"; setClass(ui.status, pass);
 
-  // rPPG stream: mean GREEN in ROI
+  // rPPG stream
   const now = performance.now()/1000;
   if (rgb.n>0){
-    greenSeries.push(rgb.g);
-    sampleTimes.push(now);
+    greenSeries.push(rgb.g); sampleTimes.push(now);
     if (greenSeries.length>MAX_SERIES) { greenSeries.splice(0,greenSeries.length-MAX_SERIES); sampleTimes.splice(0,sampleTimes.length-MAX_SERIES); }
     plotSeries(greenSeries);
   }
+
+  // Accumulate ROI view + vesselness during recording
+  if (recording && roiPoly){
+    const crop = extractGreenInRoi(frame, roiPoly, roiCanvas.width, roiCanvas.height);
+    const enh  = vesselnessTopHat(crop.g, crop.w, crop.h, crop.mask, 3);
+
+    // ROI view (grayscale of mean G)
+    const roiImg = roiCtx.createImageData(crop.w, crop.h);
+    for (let i=0;i<crop.w*crop.h;i++){
+      const v = Math.round(crop.g[i]); // 0..255 approx
+      roiImg.data[4*i+0]=v; roiImg.data[4*i+1]=v; roiImg.data[4*i+2]=v; roiImg.data[4*i+3]=255;
+    }
+    roiCtx.putImageData(roiImg, 0, 0);
+
+    // Accumulate vesselness
+    if (!vesselSum) vesselSum = new Float32Array(crop.w*crop.h);
+    for (let i=0;i<enh.length;i++) vesselSum[i] += enh[i];
+    vesselCount++;
+  }
 }
 
-// Animation loop: if FaceMesh didn’t run yet, paint current video frame + fallback ROI so record still works
+function onResults(res){
+  if(!running) return;
+  ctx.save();
+  if (selectedFacingMode()==="user") { ctx.translate(overlay.width, 0); ctx.scale(-1, 1); } // mirror selfie
+  ctx.drawImage(res.image,0,0,overlay.width,overlay.height);
+  roiPoly = null;
+  if (res.multiFaceLandmarks && res.multiFaceLandmarks.length>0) {
+    roiPoly = buildRoiFromLandmarks(res.multiFaceLandmarks[0], overlay.width, overlay.height);
+    drawPolyFilled(roiPoly);
+  } else {
+    roiPoly = fallbackRoi(overlay.width, overlay.height);
+    drawPolyFilled(roiPoly, 'rgba(0,200,255,0.9)','rgba(0,200,255,0.15)');
+  }
+  ctx.restore();
+  computeMetricsAndUpdateUI();
+}
+
+/* ---------- Main loop ---------- */
 async function loop(){
   if(!running) return;
   try {
-    if (faceMeshReady) {
-      await faceMesh.send({ image: video });
-    } else {
-      // draw raw frame with fallback ROI (before FaceMesh loads)
+    if (faceMeshReady) { await faceMesh.send({ image: video }); }
+    else { // minimal fallback before FaceMesh loads
       ctx.drawImage(video,0,0,overlay.width,overlay.height);
       roiPoly = fallbackRoi(overlay.width, overlay.height);
-      drawPoly(roiPoly, 'rgba(0,200,255,0.8)');
+      drawPolyFilled(roiPoly, 'rgba(0,200,255,0.9)','rgba(0,200,255,0.15)');
       computeMetricsAndUpdateUI();
     }
-  } catch(e){
-    logDebug('Loop error: ' + e.message, true);
-  }
+  } catch(e){ logDebug('Loop error: ' + e.message, true); }
   requestAnimationFrame(loop);
 }
 
-// Start / Stop / Record controls
+/* ---------- Controls ---------- */
 async function start(){
   ui.btnRecord.disabled = true;
   logDebug('Starting camera…');
-  await startCamera();
-  resizeCanvases();
+  await startCamera(); resizeCanvases();
   logDebug('Initializing FaceMesh…');
   try { await initFaceMesh(); } catch(e){ logDebug('FaceMesh init error: '+e.message, true); }
-  running = true;
-  ui.recStatus.textContent = "Live";
-  ui.btnRecord.disabled = false;
-  loop();
+  running = true; ui.recStatus.textContent = "Live"; ui.btnRecord.disabled = false; loop();
 }
 function stop(){
-  running = false;
-  const s = video.srcObject; if (s) s.getTracks().forEach(t=>t.stop());
-  video.srcObject = null;
-  cancelCountdown();
-  ui.recStatus.textContent = "Idle";
-  logDebug('Stopped.');
+  running=false; stopCamera(); cancelCountdown(); ui.recStatus.textContent="Idle"; logDebug('Stopped.');
 }
 function startRecording(){
   if(!running || recording) return;
-  recording = true; recordStart = performance.now()/1000;
-  ui.btnRecord.disabled = true;
-  let left = 10.0;
-  ui.recStatus.textContent = `Recording: ${left.toFixed(1)}s`;
-  recTimer = setInterval(()=>{
+  recording=true; recordStart=performance.now()/1000; ui.btnRecord.disabled=true;
+  vesselSum=null; vesselCount=0; roiCtx.clearRect(0,0,roiCanvas.width,roiCanvas.height); vesselCtx.clearRect(0,0,vesselCanvas.width,vesselCanvas.height);
+  let left=10.0; ui.recStatus.textContent=`Recording: ${left.toFixed(1)}s`;
+  recTimer=setInterval(()=>{
     left = Math.max(0, 10 - (performance.now()/1000 - recordStart));
     ui.recStatus.textContent = `Recording: ${left.toFixed(1)}s`;
-    if (left <= 0.0) stopRecordingAndAnalyze();
-  }, 100);
+    if (left<=0.0) stopRecordingAndAnalyze();
+  },100);
 }
 function cancelCountdown(){ if(recTimer){ clearInterval(recTimer); recTimer=null; } }
 function stopRecordingAndAnalyze(){
-  cancelCountdown();
-  recording = false;
-  ui.recStatus.textContent = "Analyzing…";
-  // last ~10s
+  cancelCountdown(); recording=false; ui.recStatus.textContent="Analyzing…";
+
+  // rPPG (last ~10s)
   const now = sampleTimes.length? sampleTimes[sampleTimes.length-1] : 0;
   const idx = sampleTimes.findIndex(t => t>= now-10);
   const times = idx>=0 ? sampleTimes.slice(idx) : sampleTimes.slice();
   const vals  = idx>=0 ? greenSeries.slice(idx)  : greenSeries.slice();
   const res = analyzeRppg(times, vals);
-  ui.rHR.textContent = res.hr ? res.hr.toString() : "—";
+  ui.rHR.textContent   = res.hr   ? res.hr.toString() : "—";
   ui.rACDC.textContent = res.acdc ? res.acdc : "—";
-  ui.rSNR.textContent = res.snr ? res.snr : "—";
-  ui.recStatus.textContent = "Done";
-  ui.btnRecord.disabled = false;
+  ui.rSNR.textContent  = res.snr  ? res.snr  : "—";
+
+  // Vesselness avg rendering
+  if (vesselSum && vesselCount>0){
+    const avg = new Uint8ClampedArray(vesselSum.length);
+    let maxv=1e-6; for(let i=0;i<vesselSum.length;i++) if(vesselSum[i]>maxv) maxv=vesselSum[i];
+    for(let i=0;i<avg.length;i++) avg[i]=Math.round(255*(vesselSum[i]/maxv));
+    const vsImg = vesselCtx.createImageData(roiCanvas.width, roiCanvas.height);
+    for (let i=0;i<avg.length;i++){
+      const v=avg[i]; vsImg.data[4*i+0]=v*0.6; vsImg.data[4*i+1]=v; vsImg.data[4*i+2]=v*0.8; vsImg.data[4*i+3]=255;
+    }
+    vesselCtx.putImageData(vsImg,0,0);
+  }
+  ui.recStatus.textContent="Done"; ui.btnRecord.disabled=false;
 }
 
-// Wire up buttons
+/* ---------- Wire buttons ---------- */
 ui.btnStart.onclick = async ()=>{ if(!running) await start(); };
-ui.btnStop.onclick = ()=> stop();
-ui.btnRecord.onclick = ()=> startRecording();
+ui.btnStop.onclick  = ()=> stop();
+ui.btnRecord.onclick= ()=> startRecording();
 
-// Basic runtime checks
+/* ---------- Runtime guard ---------- */
 window.addEventListener('error', e => logDebug('JS error: ' + e.message, true));
 if (!('mediaDevices' in navigator)) logDebug('Error: mediaDevices not available (use Safari over HTTPS).', true);
 </script>
