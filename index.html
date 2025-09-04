@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<title>Conjunctival Eye ROI • Ellipse + rPPG (iPhone Safari)</title>
+<title>Conjunctival Eye ROI • Ellipse + rPPG (fixed AR)</title>
 <style>
   :root{--fg:#e8f0ff;--bg:#0b1220;--mut:#a8b4d9;--ok:#95f395;--warn:#ffd27d;--bad:#ff7d7d;--card:rgba(255,255,255,.06);--line:rgba(255,255,255,.12)}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial}
@@ -18,27 +18,28 @@
   .metric .val{font-size:16px}
   .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
   .hint{font-size:12px;color:var(--mut)}
-  /* Preview stack: canvas scales responsively with preserved aspect (height auto) */
   .stack{position:relative}
   #video{display:none}
+  /* The canvas scales responsively with preserved aspect ratio (set from JS) */
   #overlay{width:100%;height:auto;display:block;border-radius:12px;background:#000;max-height:360px}
   .plot{height:110px;background:rgba(0,0,0,.3);border-radius:8px;width:100%}
   .rail{position:sticky;top:8px;display:flex;flex-direction:column;gap:10px}
   .rail h3{margin:.2rem 0 .4rem;font-size:14px;color:var(--mut)}
   .thumb{width:100%;height:auto;border-radius:10px;background:#000;display:block}
-  /* Bottom dock (always reachable) */
+  .legend{font-size:11px;color:var(--mut);margin-top:6px}
   .dock{position:fixed;left:0;right:0;bottom:0;padding:8px 10px calc(8px + env(safe-area-inset-bottom));background:rgba(10,14,26,.9);backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;justify-content:space-between;z-index:50}
   .pill{padding:6px 10px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);font-size:12px;display:flex;gap:8px;align-items:center}
   .btn{background:#2a3656;border:1px solid #3b4a74;color:var(--fg);padding:10px 12px;border-radius:12px;font-weight:600}
   .btn[disabled]{opacity:.5}
   #recStatus{font-size:12px}
   #debug{font-size:12px}
+  label{user-select:none}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h2>Conjunctival Eye ROI • Ellipse</h2>
-  <div class="hint">Safari on iPhone, HTTPS (GitHub Pages). Use **Selfie** for one eye; controls are fixed at the bottom.</div>
+  <h2>Conjunctival Eye ROI • Rotated Ellipse</h2>
+  <div class="hint">Use Selfie, center ONE eye. Buttons are fixed at bottom. If you see a cyan dashed bar, landmarks were lost (fallback).</div>
 
   <div class="grid">
     <div>
@@ -82,29 +83,30 @@
 
     <div class="rail">
       <div class="card">
-        <h3>Aiming crop (live, no stretch)</h3>
+        <h3>Aiming crop (live)</h3>
         <canvas id="aimView" width="320" height="220" class="thumb"></canvas>
       </div>
       <div class="card">
         <div class="row">
-          <div class="metric"><h4>ROI View (10-s)</h4></div>
-          <div class="metric"><h4>Vesselness (10-s avg)</h4></div>
+          <div class="metric"><h4>Masked ROI (10 s)</h4></div>
+          <div class="metric"><h4>Vesselness (10 s avg)</h4></div>
         </div>
         <div class="row">
           <canvas id="roiView" width="240" height="160" class="thumb"></canvas>
           <canvas id="vesselView" width="240" height="160" class="thumb"></canvas>
         </div>
+        <div class="legend">Bright lines = stronger linear structures (capillary-like) within masked conjunctiva. Smooth, faint = poor focus/lighting/motion.</div>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Bottom dock controls -->
 <div class="dock">
   <div class="pill">
     <span>Camera:</span>
     <label><input type="radio" name="cam" value="environment"> Rear</label>
     <label><input type="radio" name="cam" value="user" checked> Selfie</label>
+    <label><input type="checkbox" id="eyeSide" checked> Right eye</label>
     <span id="recStatus">Idle</span>
   </div>
   <div style="display:flex;gap:8px">
@@ -117,21 +119,23 @@
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.min.js"></script>
 <script>
 /* Elements */
-const video=document.getElementById('video');
-const overlay=document.getElementById('overlay'); const ctx=overlay.getContext('2d');
-const aimCanvas=document.getElementById('aimView'); const aimCtx=aimCanvas.getContext('2d');
-const roiCanvas=document.getElementById('roiView'); const roiCtx=roiCanvas.getContext('2d');
-const vesselCanvas=document.getElementById('vesselView'); const vesselCtx=vesselCanvas.getContext('2d');
-const plot=document.getElementById('plot'); const pctx=plot.getContext('2d');
-const dbg=document.getElementById('debug');
-const ui={
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay'); const ctx = overlay.getContext('2d');
+const aimCanvas = document.getElementById('aimView'); const aimCtx = aimCanvas.getContext('2d');
+const roiCanvas = document.getElementById('roiView'); const roiCtx = roiCanvas.getContext('2d');
+const vesselCanvas = document.getElementById('vesselView'); const vesselCtx = vesselCanvas.getContext('2d');
+const plot = document.getElementById('plot'); const pctx = plot.getContext('2d');
+const dbg = document.getElementById('debug');
+const ui = {
   focus: mFocus, motion: mMotion, glare: mGlare, roi: mRoi, status: mStatus,
   pR, pG, pB, pRG, rHR, rACDC, rSNR,
-  btnStart: btnStart, btnStop: btnStop, btnRecord: btnRecord, recStatus: recStatus
+  btnStart: btnStart, btnStop: btnStop, btnRecord: btnRecord, recStatus: recStatus,
+  eyeSide: document.getElementById('eyeSide')
 };
 
 /* State */
-let running=false, faceMesh, faceMeshReady=false, roiPoly=null;
+let running=false, faceMesh, faceMeshReady=false;
+let roiEllipse=null; // {cx,cy,a,b,theta}
 let lastGraySmall=null, greenSeries=[], sampleTimes=[];
 let vesselSum=null, vesselCount=0, recording=false, recordStart=0, recTimer=null;
 const MAX_SERIES=600;
@@ -141,9 +145,12 @@ const TH={minVarLap:80,maxMotion:0.08,maxGlare:0.10,minRoiFrac:0.02};
 function logDebug(m,e=false){ dbg.textContent=m; dbg.className=e?'bad':'hint'; }
 function selectedFacingMode(){ const r=[...document.querySelectorAll('input[name="cam"]')].find(x=>x.checked); return r? r.value:"environment"; }
 function setClass(el, ok){ el.className='val '+(ok?'ok':'warn'); }
-function resizeToVideo(){
-  overlay.width=video.videoWidth||1280; overlay.height=video.videoHeight||720;
-  plot.width=Math.min(overlay.width,900); plot.height=110;
+function setCanvasAspectFromVideo(){
+  // Intrinsic bitmap size = video size; also inform CSS aspect-ratio to prevent squish
+  overlay.width = video.videoWidth || 1280;
+  overlay.height = video.videoHeight || 720;
+  overlay.style.aspectRatio = `${overlay.width} / ${overlay.height}`;
+  plot.width = Math.min(overlay.width, 900); plot.height = 110;
 }
 function toGraySmall(imageData,w,h,outW=160,outH=120){
   const gray=new Uint8ClampedArray(outW*outH), d=imageData.data;
@@ -162,90 +169,84 @@ function varianceOfLaplacian(gray,w,h){
   if(n<2) return 0; const m=s/n; return ss/n - m*m;
 }
 function normalizedMADDiff(prev,curr){ let sa=0, sc=0, n=curr.length; for(let i=0;i<n;i++){ sa+=Math.abs(curr[i]-prev[i]); sc+=curr[i]; } const mi=Math.max(1,sc/n); return (sa/n)/mi; }
-function glareFraction(imageData, poly){
-  const {width:w,height:h,data}=imageData, bb=polyBBox(poly);
-  let cnt=0, br=0; const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(w-1,Math.ceil(bb.maxX));
-  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(h-1,Math.ceil(bb.maxY));
-  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
-    if(!pointInPoly(x,y,poly)) continue; const idx=(y*w+x)*4;
-    const Y=0.299*data[idx]+0.587*data[idx+1]+0.114*data[idx+2]; cnt++; if(Y>=245) br++;
-  }
-  return cnt? br/cnt : 1.0;
+function pointInEllipse(x,y,el){ // (x',y') in rotated frame
+  const ct=Math.cos(el.theta), st=Math.sin(el.theta);
+  const dx=x-el.cx, dy=y-el.cy;
+  const xp= ct*dx + st*dy, yp= -st*dx + ct*dy;
+  return (xp*xp)/(el.a*el.a) + (yp*yp)/(el.b*el.b) <= 1.0;
 }
-function meanRGB(imageData, poly){
-  const {width:w,height:h,data}=imageData, bb=polyBBox(poly);
-  let sr=0,sg=0,sb=0,n=0; const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(w-1,Math.ceil(bb.maxX));
-  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(h-1,Math.ceil(bb.maxY));
-  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
-    if(!pointInPoly(x,y,poly)) continue; const idx=(y*w+x)*4; sr+=data[idx]; sg+=data[idx+1]; sb+=data[idx+2]; n++;
-  }
-  return n? {r:sr/n,g:sg/n,b:sb/n,n} : {r:0,g:0,b:0,n:0};
+function ellipseBBox(el){
+  // Conservative bbox from axes (rotation-aware approximation)
+  const ct=Math.cos(el.theta), st=Math.sin(el.theta);
+  const wx=Math.hypot(el.a*ct, el.b*st);
+  const wy=Math.hypot(el.a*st, el.b*ct);
+  return {minX:el.cx-wx, maxX:el.cx+wx, minY:el.cy-wy, maxY:el.cy+wy};
 }
-function polyBBox(poly){ let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9; for(const p of poly){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; } return {minX,minY,maxX,maxY}; }
-function pointInPoly(x,y,poly){ let inside=false; for(let i=0,j=poly.length-1;i<poly.length;j=i++){ const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y; const inter=((yi>y)!=(yj>y))&&(x< (xj-xi)*(y-yi)/(yj-yi)+xi); if(inter) inside=!inside; } return inside; }
-function drawPolyFilled(poly, stroke='rgba(255,255,0,0.95)', fill='rgba(255,255,0,0.15)'){
-  if(!poly||!poly.length) return; ctx.save(); ctx.fillStyle=fill; ctx.strokeStyle=stroke; ctx.lineWidth=2;
-  ctx.beginPath(); ctx.moveTo(poly[0].x,poly[0].y); for(let i=1;i<poly.length;i++) ctx.lineTo(poly[i].x,poly[i].y);
-  ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+function ellipseArea(el){ return Math.PI*el.a*el.b; }
+function drawEllipse(el, stroke='rgba(255,230,0,0.95)', fill='rgba(255,230,0,0.15)'){
+  if(!el) return;
+  ctx.save();
+  ctx.translate(el.cx, el.cy);
+  ctx.rotate(el.theta);
+  ctx.beginPath();
+  ctx.ellipse(0,0, el.a, el.b, 0, 0, Math.PI*2);
+  ctx.fillStyle=fill; ctx.strokeStyle=stroke; ctx.lineWidth=2;
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
 }
-/* PCA-based ellipse fit to eye landmarks (single eye) */
-function fitEyeEllipse(lm, W, H, right=true, scale=1.0){
-  // Full right eye contour (MediaPipe indices); left counterpart below
+function drawFallbackBand(W,H){
+  const y0=H*0.45, y1=y0+Math.max(8,H*0.03), x0=W*0.30, x1=W*0.70;
+  ctx.save();
+  ctx.setLineDash([8,6]); ctx.strokeStyle='rgba(0,220,255,0.95)'; ctx.lineWidth=2;
+  ctx.strokeRect(x0,y0, x1-x0, y1-y0);
+  ctx.restore();
+}
+
+/* Eye ellipse fit (single eye) */
+function fitEyeEllipse(lm,W,H,right=true,scale=1.15){
   const eyeR=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
   const eyeL=[263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466];
   const ids = right? eyeR : eyeL;
   const pts = ids.map(i=>({x:lm[i].x*W, y:lm[i].y*H}));
-  // mean
   let cx=0, cy=0; for(const p of pts){ cx+=p.x; cy+=p.y; } cx/=pts.length; cy/=pts.length;
-  // covariance
-  let sxx=0, syy=0, sxy=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy; }
+  let sxx=0,syy=0,sxy=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy; }
   sxx/=pts.length; syy/=pts.length; sxy/=pts.length;
-  // eigen (2x2)
-  const T=sxx+syy, D=sxx*syy - sxy*sxy;
-  const disc=Math.max(0, T*T/4 - D);
+  const T=sxx+syy, D=sxx*syy - sxy*sxy, disc=Math.max(0, T*T/4 - D);
   const l1=T/2 + Math.sqrt(disc), l2=T/2 - Math.sqrt(disc);
-  // principal axes (eigenvectors)
-  let vx1,vy1,vx2,vy2;
-  if(Math.abs(sxy)>1e-6){ vx1=l1-syy; vy1=sxy; const n1=Math.hypot(vx1,vy1)||1; vx1/=n1; vy1/=n1; vx2=-vy1; vy2=vx1; }
-  else { vx1=1; vy1=0; vx2=0; vy2=1; }
-  // radii = max projection of points onto each axis (scaled)
-  let a=0,b=0;
-  for(const p of pts){
-    const dx=p.x-cx, dy=p.y-cy;
-    const t1=Math.abs(dx*vx1 + dy*vy1); if(t1>a) a=t1;
-    const t2=Math.abs(dx*vx2 + dy*vy2); if(t2>b) b=t2;
-  }
+  let vx1,vy1; if(Math.abs(sxy)>1e-6){ vx1=l1-syy; vy1=sxy; const n=Math.hypot(vx1,vy1)||1; vx1/=n; vy1/=n; } else { vx1=1; vy1=0; }
+  let a=0,b=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; const t1=Math.abs(dx*vx1 + dy*vy1); const t2=Math.abs(-dx*vy1 + dy*vx1); if(t1>a) a=t1; if(t2>b) b=t2; }
   a*=scale; b*=scale;
-  // polygon approximation of rotated ellipse
-  const poly=[]; const N=64;
-  for(let k=0;k<N;k++){
-    const th=2*Math.PI*k/N;
-    const ex=a*Math.cos(th), ey=b*Math.sin(th);
-    const x=cx + ex*vx1 + ey*vx2;
-    const y=cy + ex*vy1 + ey*vy2;
-    poly.push({x,y});
-  }
-  return {poly,center:{x:cx,y:cy},axes:{a,b},vecs:{vx1,vy1,vx2,vy2}};
+  const theta=Math.atan2(vy1, vx1);
+  return {cx,cy,a,b,theta};
 }
-/* Fallback band */
-function fallbackRoi(W,H){ const y0=H*0.45,y1=y0+Math.max(8,H*0.03),x0=W*0.30,x1=W*0.70; return [{x:x0,y:y0},{x:x1,y:y0},{x:x1,y:y1},{x:x0,y:y1}]; }
-/* Box blur */
-function boxBlur(gray,w,h,r=3){ const tmp=new Float32Array(w*h), out=new Float32Array(w*h);
-  for(let y=0;y<h;y++){ let sum=0; for(let x=0;x<w;x++){ const x0=Math.max(0,x-r), x1=Math.min(w-1,x+r);
-    if(x===0){ sum=0; for(let i=x0;i<=x1;i++) sum+=gray[y*w+i]; } else { const prev=Math.max(0,x-1-r), next=Math.min(w-1,x+r); sum += gray[y*w+next]-gray[y*w+prev]; }
-    tmp[y*w+x]=sum/(x1-x0+1); } }
-  for(let x=0;x<w;x++){ let sum=0; for(let y=0;y<h;y++){ const y0=Math.max(0,y-r), y1=Math.min(h-1,y+r);
-    if(y===0){ sum=0; for(let j=y0;j<=y1;j++) sum+=tmp[j*w+x]; } else { const prev=Math.max(0,y-1-r), next=Math.min(h-1,y+r); sum += tmp[next*w+x]-tmp[prev*w+x]; }
-    out[y*w+x]=sum/(y1-y0+1); } } return out;
+
+/* MediaPipe */
+let rightEye=true;
+async function initFaceMesh(){
+  faceMesh=new FaceMesh.FaceMesh({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+  faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
+  faceMesh.onResults(onResults); faceMeshReady=true; logDebug('FaceMesh initialized.');
 }
-/* Conjunctiva-ish mask inside ROI (drop sclera glare, lashes, too-dark/too-bright) */
-function conjunctivaMask(imageData, roiPoly){
-  const {width:W,height:H,data}=imageData, bb=polyBBox(roiPoly);
+
+/* Camera */
+async function startCamera(){
+  try{
+    const mode=selectedFacingMode();
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:mode},width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=stream;
+    await new Promise(res=> video.onloadedmetadata=()=>{ video.play(); setCanvasAspectFromVideo(); res(); });
+  }catch(e){ logDebug('Camera error: '+e.message,true); throw e; }
+}
+function stopCamera(){ const s=video.srcObject; if(s) s.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
+
+/* Image ops (mask, vesselness, etc.) */
+function conjunctivaMask(imageData, el){
+  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
   const x0=Math.max(0,Math.floor(bb.minX)), x1=Math.min(W-1,Math.ceil(bb.maxX));
   const y0=Math.max(0,Math.floor(bb.minY)), y1=Math.min(H-1,Math.ceil(bb.maxY));
   const outW=x1-x0+1, outH=y1-y0+1, mask=new Uint8Array(outW*outH);
   for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
-    if(!pointInPoly(x,y,roiPoly)) continue;
+    if(!pointInEllipse(x,y,el)) continue;
     const idx=(y*W+x)*4, r=data[idx], g=data[idx+1], b=data[idx+2];
     const V=Math.max(r,g,b), S= V? (V - Math.min(r,g,b))/V : 0;
     const isSclera=(V>240 && S<0.12), isLash=(V<35);
@@ -254,12 +255,12 @@ function conjunctivaMask(imageData, roiPoly){
   }
   return {mask,x0,y0,w:outW,h:outH};
 }
-function extractGreenConj(imageData, roiPoly, outW=240, outH=160){
-  const {width:W,height:H,data}=imageData, bb=polyBBox(roiPoly);
+function extractGreenConj(imageData, el, outW=240, outH=160){
+  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
   const x0=Math.max(0,Math.floor(bb.minX)), x1=Math.min(W-1,Math.ceil(bb.maxX));
   const y0=Math.max(0,Math.floor(bb.minY)), y1=Math.min(H-1,Math.ceil(bb.maxY));
   const roiW=x1-x0+1, roiH=y1-y0+1;
-  const m = conjunctivaMask(imageData, roiPoly);
+  const m=conjunctivaMask(imageData, el);
   const g=new Float32Array(outW*outH), mask=new Uint8Array(outW*outH);
   for(let j=0;j<outH;j++){ const sy=y0 + Math.floor(j*roiH/outH);
     for(let i=0;i<outW;i++){ const sx=x0 + Math.floor(i*roiW/outW); const idx=(sy*W+sx)*4;
@@ -267,14 +268,23 @@ function extractGreenConj(imageData, roiPoly, outW=240, outH=160){
       mask[j*outW+i]=mVal?1:0; g[j*outW+i]=mVal? data[idx+1] : 0;
     }
   }
-  return {g,w:outW,h:outH,mask,bb:{x0,y0,x1,y1}};
+  return {g,w:outW,h:outH,mask};
+}
+function boxBlur(gray,w,h,r=3){ const tmp=new Float32Array(w*h), out=new Float32Array(w*h);
+  for(let y=0;y<h;y++){ let sum=0; for(let x=0;x<w;x++){ const x0=Math.max(0,x-r), x1=Math.min(w-1,x+r);
+    if(x===0){ sum=0; for(let i=x0;i<=x1;i++) sum+=gray[y*w+i]; } else { const prev=Math.max(0,x-1-r), next=Math.min(w-1,x+r); sum += gray[y*w+next]-gray[y*w+prev]; }
+    tmp[y*w+x]=sum/(x1-x0+1); } }
+  for(let x=0;x<w;x++){ let sum=0; for(let y=0;y<h;y++){ const y0=Math.max(0,y-r), y1=Math.min(h-1,y+r);
+    if(y===0){ sum=0; for(let j=y0;j<=y1;j++) sum+=tmp[j*w+x]; } else { const prev=Math.max(0,y-1-r), next=Math.min(h-1,y+r); sum += tmp[next*w+x]-tmp[prev*w+x]; }
+    out[y*w+x]=sum/(y1-y0+1); } } return out;
 }
 function vesselnessTopHatMasked(g,w,h,mask,blurR=3){
   const blurred=boxBlur(g,w,h,blurR); const raw=new Float32Array(w*h); let maxv=1e-6;
   for(let i=0;i<w*h;i++){ const v=mask[i]? Math.max(0, g[i]-blurred[i]) : 0; raw[i]=v; if(v>maxv) maxv=v; }
   const out=new Uint8ClampedArray(w*h); for(let i=0;i<w*h;i++) out[i]=Math.round(255*(raw[i]/maxv)); return out;
 }
-/* rPPG plotting + analysis */
+
+/* rPPG */
 function plotSeries(series){
   const w=plot.width,h=plot.height; pctx.clearRect(0,0,w,h);
   if(series.length<2) return;
@@ -303,43 +313,19 @@ function analyzeRppg(times, vals){
   return {hr, acdc: acdc? acdc.toFixed(4):null, snr};
 }
 
-/* MediaPipe */
-async function initFaceMesh(){
-  faceMesh=new FaceMesh.FaceMesh({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
-  faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.5,minTrackingConfidence:0.5});
-  faceMesh.onResults(onResults); faceMeshReady=true; logDebug('FaceMesh initialized.');
-}
-
-/* Camera */
-async function startCamera(){
-  try{
-    const mode=selectedFacingMode();
-    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:mode},width:{ideal:1280},height:{ideal:720}},audio:false});
-    video.srcObject=stream;
-    await new Promise(res=> video.onloadedmetadata=()=>{ video.play(); resizeToVideo(); res(); });
-  }catch(e){ logDebug('Camera error: '+e.message,true); throw e; }
-}
-function stopCamera(){ const s=video.srcObject; if(s) s.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
-
-/* ROI builders */
-function buildEyeEllipse(lm,W,H,right=true){
-  const {poly}=fitEyeEllipse(lm,W,H,right,1.15); // 15% pad to cover palpebral conjunctiva
-  return poly;
-}
-
 /* Frame processing */
 function onResults(res){
   if(!running) return;
   ctx.save();
-  if(selectedFacingMode()==="user"){ ctx.translate(overlay.width,0); ctx.scale(-1,1); } // mirror selfie
+  if(selectedFacingMode()==="user"){ ctx.translate(overlay.width,0); ctx.scale(-1,1); }
   ctx.drawImage(res.image,0,0,overlay.width,overlay.height);
-  roiPoly=null;
+  roiEllipse=null;
   if(res.multiFaceLandmarks && res.multiFaceLandmarks.length>0){
-    roiPoly=buildEyeEllipse(res.multiFaceLandmarks[0], overlay.width, overlay.height, true); // single RIGHT eye
-    drawPolyFilled(roiPoly);
-  }else{
-    roiPoly=fallbackRoi(overlay.width,overlay.height);
-    drawPolyFilled(roiPoly,'rgba(0,200,255,0.95)','rgba(0,200,255,0.18)');
+    const lm = res.multiFaceLandmarks[0];
+    roiEllipse = fitEyeEllipse(lm, overlay.width, overlay.height, rightEye, 1.15);
+    drawEllipse(roiEllipse);
+  } else {
+    drawFallbackBand(overlay.width, overlay.height);
   }
   ctx.restore();
   computeMetricsAndUpdateUI();
@@ -352,43 +338,67 @@ function computeMetricsAndUpdateUI(){
   const motion=lastGraySmall? normalizedMADDiff(lastGraySmall,gray):0; lastGraySmall=gray;
 
   let glare=1.0, rgb={r:0,g:0,b:0,n:0}, roiFrac=0;
-  if(roiPoly){
-    glare=glareFraction(frame,roiPoly);
-    rgb=meanRGB(frame,roiPoly);
-    const bb=polyBBox(roiPoly); roiFrac=((bb.maxX-bb.minX)*(bb.maxY-bb.minY))/(overlay.width*overlay.height);
+  if(roiEllipse){
+    // simple approximated coverage from bbox area
+    const bb=ellipseBBox(roiEllipse);
+    glare = glareFractionEllipse(frame, roiEllipse);
+    rgb = meanRGBEllipse(frame, roiEllipse);
+    roiFrac = ((bb.maxX-bb.minX)*(bb.maxY-bb.minY))/(overlay.width*overlay.height);
   }
 
-  if(rgb.n>0){ ui.pR.textContent=rgb.r.toFixed(0); ui.pG.textContent=rgb.g.toFixed(0); ui.pB.textContent=rgb.b.toFixed(0); ui.pRG.textContent= (rgb.g>0?(rgb.r/rgb.g).toFixed(3):"—"); }
+  if(rgb.n>0){ pR.textContent=rgb.r.toFixed(0); pG.textContent=rgb.g.toFixed(0); pB.textContent=rgb.b.toFixed(0); pRG.textContent=(rgb.g>0?(rgb.r/rgb.g).toFixed(3):"—"); }
 
   const focusOk=varLap>=TH.minVarLap, motionOk=motion<=TH.maxMotion||!lastGraySmall, glareOk=glare<=TH.maxGlare, roiOk=roiFrac>=TH.minRoiFrac;
-  const pass=focusOk&&motionOk&&glareOk&&roiOk;
-  ui.focus.textContent=varLap.toFixed(0); setClass(ui.focus,focusOk);
-  ui.motion.textContent=motion.toFixed(3); setClass(ui.motion,motionOk);
-  ui.glare.textContent=(glare*100).toFixed(1)+"%"; setClass(ui.glare,glareOk);
-  ui.roi.textContent=(roiFrac*100).toFixed(2)+"%"; setClass(ui.roi,roiOk);
-  ui.status.textContent= pass ? "PASS" : "Adjust aim / light / stability"; setClass(ui.status,pass);
+  mFocus.textContent=varLap.toFixed(0); setClass(mFocus,focusOk);
+  mMotion.textContent=motion.toFixed(3); setClass(mMotion,motionOk);
+  mGlare.textContent=(glare*100).toFixed(1)+"%"; setClass(mGlare,glareOk);
+  mRoi.textContent=(roiFrac*100).toFixed(2)+"%"; setClass(mRoi,roiOk);
+  mStatus.textContent= focusOk&&motionOk&&glareOk&&roiOk ? "PASS":"Adjust aim / light / stability"; setClass(mStatus, focusOk&&motionOk&&glareOk&&roiOk);
 
   const now=performance.now()/1000;
-  if(rgb.n>0){ greenSeries.push(rgb.g); sampleTimes.push(now);
+  if(rgb.n>0){
+    greenSeries.push(rgb.g); sampleTimes.push(now);
     if(greenSeries.length>MAX_SERIES){ greenSeries.splice(0,greenSeries.length-MAX_SERIES); sampleTimes.splice(0,sampleTimes.length-MAX_SERIES); }
     plotSeries(greenSeries);
   }
 
-  // Aiming crop (no aspect distortion): draw a padded bbox around ellipse using "contain"
-  if(roiPoly){
-    const bb=polyBBox(roiPoly);
+  // Aiming crop (contain, no stretch)
+  if(roiEllipse){
+    const bb=ellipseBBox(roiEllipse);
     const padX=Math.max(8,(bb.maxX-bb.minX)*0.35), padY=Math.max(8,(bb.maxY-bb.minY)*0.8);
     const sx=Math.max(0,Math.floor(bb.minX-padX)), sy=Math.max(0,Math.floor(bb.minY-padY));
     const sw=Math.min(overlay.width-1,Math.ceil(bb.maxX+padX))-sx+1;
     const sh=Math.min(overlay.height-1,Math.ceil(bb.maxY+padY))-sy+1;
-    // compute scale to contain into aimCanvas
     const S=Math.min(aimCanvas.width/sw, aimCanvas.height/sh);
-    const dw=sw*S, dh=sh*S; const dx=(aimCanvas.width-dw)/2, dy=(aimCanvas.height-dh)/2;
+    const dw=sw*S, dh=sh*S, dx=(aimCanvas.width-dw)/2, dy=(aimCanvas.height-dh)/2;
     aimCtx.save(); aimCtx.clearRect(0,0,aimCanvas.width,aimCanvas.height);
     if(selectedFacingMode()==="user"){ aimCtx.translate(aimCanvas.width,0); aimCtx.scale(-1,1); }
     aimCtx.drawImage(overlay, sx,sy,sw,sh, dx,dy,dw,dh);
     aimCtx.restore();
   }
+}
+
+/* Mean/glare over ellipse (pixel-accurate) */
+function meanRGBEllipse(imageData, el){
+  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
+  const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(W-1,Math.ceil(bb.maxX));
+  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(H-1,Math.ceil(bb.maxY));
+  let sr=0,sg=0,sb=0,n=0;
+  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+    if(!pointInEllipse(x,y,el)) continue; const idx=(y*W+x)*4; sr+=data[idx]; sg+=data[idx+1]; sb+=data[idx+2]; n++;
+  }
+  return n? {r:sr/n,g:sg/n,b:sb/n,n} : {r:0,g:0,b:0,n:0};
+}
+function glareFractionEllipse(imageData, el){
+  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
+  const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(W-1,Math.ceil(bb.maxX));
+  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(H-1,Math.ceil(bb.maxY));
+  let cnt=0, br=0;
+  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+    if(!pointInEllipse(x,y,el)) continue; const idx=(y*W+x)*4;
+    const Y=0.299*data[idx]+0.587*data[idx+1]+0.114*data[idx+2]; cnt++; if(Y>=245) br++;
+  }
+  return cnt? br/cnt : 1.0;
 }
 
 /* Loop */
@@ -398,8 +408,7 @@ async function loop(){
     if(faceMeshReady){ await faceMesh.send({image:video}); }
     else{
       ctx.drawImage(video,0,0,overlay.width,overlay.height);
-      roiPoly=fallbackRoi(overlay.width,overlay.height);
-      drawPolyFilled(roiPoly,'rgba(0,200,255,0.95)','rgba(0,200,255,0.18)');
+      drawFallbackBand(overlay.width,overlay.height);
       computeMetricsAndUpdateUI();
     }
   }catch(e){ logDebug('Loop error: '+e.message,true); }
@@ -422,28 +431,23 @@ function stopRecordingAndAnalyze(){
   const times= idx>=0? sampleTimes.slice(idx): sampleTimes.slice();
   const vals = idx>=0? greenSeries.slice(idx): greenSeries.slice();
   const res=analyzeRppg(times,vals);
-  ui.rHR.textContent = res.hr? res.hr.toString():"—";
-  ui.rACDC.textContent = res.acdc? res.acdc:"—";
-  ui.rSNR.textContent = res.snr? res.snr:"—";
+  rHR.textContent = res.hr? res.hr.toString():"—";
+  rACDC.textContent = res.acdc? res.acdc:"—";
+  rSNR.textContent = res.snr? res.snr:"—";
 
-  if(roiPoly){
+  if(roiEllipse){
     const frame=ctx.getImageData(0,0,overlay.width,overlay.height);
-    const crop=extractGreenConj(frame,roiPoly,roiCanvas.width,roiCanvas.height);
+    const crop=extractGreenConj(frame,roiEllipse,roiCanvas.width,roiCanvas.height);
     const enh=vesselnessTopHatMasked(crop.g,crop.w,crop.h,crop.mask,3);
-    // accumulate average (here single pass is fine)
-    if(!vesselSum){ vesselSum=new Float32Array(enh.length); vesselCount=0; }
-    for(let i=0;i<enh.length;i++) vesselSum[i]+=enh[i]; vesselCount++;
-
-    const avg=new Uint8ClampedArray(vesselSum.length); let maxv=1e-6;
-    for(let i=0;i<vesselSum.length;i++) if(vesselSum[i]>maxv) maxv=vesselSum[i];
-    for(let i=0;i<avg.length;i++) avg[i]=Math.round(255*(vesselSum[i]/maxv));
-    const vs=vesselCtx.createImageData(roiCanvas.width,roiCanvas.height);
-    for(let i=0;i<avg.length;i++){ const v=avg[i]; vs.data[4*i+0]=v*0.6; vs.data[4*i+1]=v; vs.data[4*i+2]=v*0.8; vs.data[4*i+3]=255; }
-    vesselCtx.putImageData(vs,0,0);
-
+    // show masked ROI
     const roiImg=roiCtx.createImageData(crop.w,crop.h);
     for(let i=0;i<crop.w*crop.h;i++){ const v=crop.mask[i]? Math.round(crop.g[i]):0; roiImg.data[4*i+0]=v; roiImg.data[4*i+1]=v; roiImg.data[4*i+2]=v; roiImg.data[4*i+3]=255; }
     roiCtx.putImageData(roiImg,0,0);
+    // show vesselness normalized
+    let maxv=1; for(let i=0;i<enh.length;i++) if(enh[i]>maxv) maxv=enh[i];
+    const vs=vesselCtx.createImageData(crop.w,crop.h);
+    for(let i=0;i<enh.length;i++){ const vv=Math.round(255*enh[i]/maxv); vs.data[4*i+0]=vv*0.6; vs.data[4*i+1]=vv; vs.data[4*i+2]=vv*0.8; vs.data[4*i+3]=255; }
+    vesselCtx.putImageData(vs,0,0);
   }
   ui.recStatus.textContent="Done"; ui.btnRecord.disabled=false;
 }
@@ -451,7 +455,7 @@ function stopRecordingAndAnalyze(){
 /* Controls */
 async function start(){
   ui.btnRecord.disabled=true; logDebug('Starting camera…');
-  await startCamera(); resizeToVideo();
+  await startCamera(); setCanvasAspectFromVideo();
   logDebug('Initializing FaceMesh…'); try{ await initFaceMesh(); }catch(e){ logDebug('FaceMesh init error: '+e.message,true); }
   running=true; ui.recStatus.textContent='Live'; ui.btnRecord.disabled=false; loop();
 }
@@ -460,6 +464,7 @@ function stop(){ running=false; stopCamera(); cancelCountdown(); ui.recStatus.te
 btnStart.onclick=async()=>{ if(!running) await start(); };
 btnStop.onclick =()=> stop();
 btnRecord.onclick=()=> startRecording();
+ui.eyeSide.onchange = ()=>{ rightEye = ui.eyeSide.checked; };
 
 /* Guards */
 window.addEventListener('error',e=>logDebug('JS error: '+e.message,true));
