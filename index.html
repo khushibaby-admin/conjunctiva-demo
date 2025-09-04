@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<title>Conjunctival Eye ROI • Ellipse + rPPG (fixed AR)</title>
+<title>Conjunctival ROI • Safe Mode (Ellipse + Manual)</title>
 <style>
   :root{--fg:#e8f0ff;--bg:#0b1220;--mut:#a8b4d9;--ok:#95f395;--warn:#ffd27d;--bad:#ff7d7d;--card:rgba(255,255,255,.06);--line:rgba(255,255,255,.12)}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial}
@@ -18,11 +18,11 @@
   .metric .val{font-size:16px}
   .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
   .hint{font-size:12px;color:var(--mut)}
-  .stack{position:relative}
-  #video{display:none}
-  /* The canvas scales responsively with preserved aspect ratio (set from JS) */
-  #overlay{width:100%;height:auto;display:block;border-radius:12px;background:#000;max-height:360px}
-  .plot{height:110px;background:rgba(0,0,0,.3);border-radius:8px;width:100%}
+  /* Aspect box (prevents squish) */
+  .aspect{position:relative;width:100%;max-width:100%;background:#000;border-radius:12px;overflow:hidden}
+  .aspect::before{content:"";display:block;width:100%;padding-top:56.25%;} /* 16:9 default; JS updates this */
+  #overlay{position:absolute;inset:0;display:block;width:100%;height:100%} /* canvas fills box; we draw with correct AR */
+  #plot{height:110px;width:100%;background:rgba(0,0,0,.3);border-radius:8px}
   .rail{position:sticky;top:8px;display:flex;flex-direction:column;gap:10px}
   .rail h3{margin:.2rem 0 .4rem;font-size:14px;color:var(--mut)}
   .thumb{width:100%;height:auto;border-radius:10px;background:#000;display:block}
@@ -38,13 +38,14 @@
 </head>
 <body>
 <div class="wrap">
-  <h2>Conjunctival Eye ROI • Rotated Ellipse</h2>
-  <div class="hint">Use Selfie, center ONE eye. Buttons are fixed at bottom. If you see a cyan dashed bar, landmarks were lost (fallback).</div>
+  <h2>Conjunctival ROI • Safe Mode</h2>
+  <div class="hint">Use Selfie. If landmarks fail, tap once on the preview to place a manual ellipse over ONE eye.</div>
 
   <div class="grid">
     <div>
-      <div class="stack">
-        <video id="video" playsinline muted></video>
+      <!-- Aspect box (no squish) -->
+      <div class="aspect" id="aspectBox">
+        <video id="video" playsinline muted style="display:none"></video>
         <canvas id="overlay"></canvas>
       </div>
 
@@ -56,6 +57,7 @@
           <div class="metric"><h4>ROI coverage</h4><div id="mRoi" class="val">—</div></div>
           <div class="metric"><h4>Status</h4><div id="mStatus" class="val">—</div></div>
         </div>
+        <div class="hint">Detector: <span id="detStatus">init…</span></div>
       </div>
 
       <div class="card">
@@ -73,7 +75,7 @@
           <div class="metric"><h4>rPPG AC/DC</h4><div id="rACDC" class="val">—</div></div>
           <div class="metric"><h4>rPPG SNR</h4><div id="rSNR" class="val">—</div></div>
         </div>
-        <canvas id="plot" class="plot"></canvas>
+        <canvas id="plot"></canvas>
       </div>
 
       <div class="card">
@@ -88,14 +90,14 @@
       </div>
       <div class="card">
         <div class="row">
-          <div class="metric"><h4>Masked ROI (10 s)</h4></div>
-          <div class="metric"><h4>Vesselness (10 s avg)</h4></div>
+          <div class="metric"><h4>Unmasked ROI (10 s)</h4></div>
+          <div class="metric"><h4>Masked & Vesselness</h4></div>
         </div>
         <div class="row">
-          <canvas id="roiView" width="240" height="160" class="thumb"></canvas>
+          <canvas id="roiUnmasked" width="240" height="160" class="thumb"></canvas>
           <canvas id="vesselView" width="240" height="160" class="thumb"></canvas>
         </div>
-        <div class="legend">Bright lines = stronger linear structures (capillary-like) within masked conjunctiva. Smooth, faint = poor focus/lighting/motion.</div>
+        <div class="legend">Left: ellipse crop; Right: mask overlay + vessel heatmap. Bright filaments = vessels.</div>
       </div>
     </div>
   </div>
@@ -110,7 +112,7 @@
     <span id="recStatus">Idle</span>
   </div>
   <div style="display:flex;gap:8px">
-    <button class="btn" id="btnStart">Start Camera</button>
+    <button class="btn" id="btnStart">Start</button>
     <button class="btn" id="btnStop">Stop</button>
     <button class="btn" id="btnRecord">Record 10s → Analyze</button>
   </div>
@@ -121,37 +123,109 @@
 /* Elements */
 const video = document.getElementById('video');
 const overlay = document.getElementById('overlay'); const ctx = overlay.getContext('2d');
+const aspectBox = document.getElementById('aspectBox');
 const aimCanvas = document.getElementById('aimView'); const aimCtx = aimCanvas.getContext('2d');
-const roiCanvas = document.getElementById('roiView'); const roiCtx = roiCanvas.getContext('2d');
+const roiUnmasked = document.getElementById('roiUnmasked'); const unmaskCtx = roiUnmasked.getContext('2d');
 const vesselCanvas = document.getElementById('vesselView'); const vesselCtx = vesselCanvas.getContext('2d');
 const plot = document.getElementById('plot'); const pctx = plot.getContext('2d');
 const dbg = document.getElementById('debug');
-const ui = {
-  focus: mFocus, motion: mMotion, glare: mGlare, roi: mRoi, status: mStatus,
-  pR, pG, pB, pRG, rHR, rACDC, rSNR,
-  btnStart: btnStart, btnStop: btnStop, btnRecord: btnRecord, recStatus: recStatus,
-  eyeSide: document.getElementById('eyeSide')
-};
+const detStatus = document.getElementById('detStatus');
+const mFocus = document.getElementById('mFocus'), mMotion=document.getElementById('mMotion'), mGlare=document.getElementById('mGlare'), mRoi=document.getElementById('mRoi'), mStatus=document.getElementById('mStatus');
+const pR=document.getElementById('pR'), pG=document.getElementById('pG'), pB=document.getElementById('pB'), pRG=document.getElementById('pRG');
+const rHR=document.getElementById('rHR'), rACDC=document.getElementById('rACDC'), rSNR=document.getElementById('rSNR');
+const btnStart = document.getElementById('btnStart'), btnStop=document.getElementById('btnStop'), btnRecord=document.getElementById('btnRecord'), recStatus=document.getElementById('recStatus');
+const eyeSide=document.getElementById('eyeSide');
 
 /* State */
 let running=false, faceMesh, faceMeshReady=false;
+let haveFace=false, lastFaceTs=0;
+let rightEye=true;
 let roiEllipse=null; // {cx,cy,a,b,theta}
+let manualEllipse=null; // set on tap
 let lastGraySmall=null, greenSeries=[], sampleTimes=[];
-let vesselSum=null, vesselCount=0, recording=false, recordStart=0, recTimer=null;
-const MAX_SERIES=600;
-const TH={minVarLap:80,maxMotion:0.08,maxGlare:0.10,minRoiFrac:0.02};
+const MAX_SERIES=600; const TH={minVarLap:80,maxMotion:0.08,maxGlare:0.12,minRoiFrac:0.02};
 
-/* Helpers */
+/* Utils */
 function logDebug(m,e=false){ dbg.textContent=m; dbg.className=e?'bad':'hint'; }
 function selectedFacingMode(){ const r=[...document.querySelectorAll('input[name="cam"]')].find(x=>x.checked); return r? r.value:"environment"; }
 function setClass(el, ok){ el.className='val '+(ok?'ok':'warn'); }
-function setCanvasAspectFromVideo(){
-  // Intrinsic bitmap size = video size; also inform CSS aspect-ratio to prevent squish
-  overlay.width = video.videoWidth || 1280;
-  overlay.height = video.videoHeight || 720;
-  overlay.style.aspectRatio = `${overlay.width} / ${overlay.height}`;
-  plot.width = Math.min(overlay.width, 900); plot.height = 110;
+function setAspectFromVideo(){
+  const W=video.videoWidth||1280, H=video.videoHeight||720;
+  overlay.width=W; overlay.height=H;
+  plot.width=Math.min(W,900); plot.height=110;
+  // Change the aspect box padding to match W/H
+  const pct = (H/W)*100; aspectBox.style.setProperty('--pad', pct+'%');
+  aspectBox.querySelector('stylepad')?.remove();
+  const s=document.createElement('style'); s.setAttribute('id','stylepad'); s.textContent=`#aspectBox::before{padding-top:${pct}%;}`; document.head.appendChild(s);
 }
+function polyBBox(poly){ let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9; for(const p of poly){ if(p.x<minX)minX=p.x; if(p.y<minY)minY=p.y; if(p.x>maxX)maxX=p.x; if(p.y>maxY)maxY=p.y; } return {minX,minY,maxX,maxY}; }
+function pointInEllipse(x,y,el){ const ct=Math.cos(el.theta), st=Math.sin(el.theta); const dx=x-el.cx, dy=y-el.cy; const xp= ct*dx + st*dy, yp= -st*dx + ct*dy; return (xp*xp)/(el.a*el.a) + (yp*yp)/(el.b*el.b) <= 1.0; }
+function ellipseBBox(el){ const ct=Math.cos(el.theta), st=Math.sin(el.theta); const wx=Math.hypot(el.a*ct, el.b*st); const wy=Math.hypot(el.a*st, el.b*ct); return {minX:el.cx-wx, maxX:el.cx+wx, minY:el.cy-wy, maxY:el.cy+wy}; }
+function drawEllipse(el, stroke='rgba(255,230,0,0.95)', fill='rgba(255,230,0,0.15)'){ ctx.save(); ctx.translate(el.cx,el.cy); ctx.rotate(el.theta); ctx.beginPath(); ctx.ellipse(0,0,el.a,el.b,0,0,Math.PI*2); ctx.fillStyle=fill; ctx.strokeStyle=stroke; ctx.lineWidth=2; ctx.fill(); ctx.stroke(); ctx.restore(); }
+function drawFallback(){ const W=overlay.width,H=overlay.height, y0=H*0.45, y1=y0+Math.max(8,H*0.03), x0=W*0.30, x1=W*0.70; ctx.save(); ctx.setLineDash([8,6]); ctx.strokeStyle='rgba(0,220,255,0.95)'; ctx.lineWidth=2; ctx.strokeRect(x0,y0,x1-x0,y1-y0); ctx.restore(); }
+
+/* FaceMesh (auto eye) */
+async function initFaceMesh(){
+  faceMesh = new FaceMesh.FaceMesh({ locateFile: (f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}` });
+  faceMesh.setOptions({ maxNumFaces:1, refineLandmarks:true, minDetectionConfidence:0.6, minTrackingConfidence:0.6 });
+  faceMesh.onResults(onResults);
+  faceMeshReady=true; detStatus.textContent='model ready';
+}
+function fitEyeEllipse(lm,W,H,right=true,scale=1.15){
+  const eyeR=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+  const eyeL=[263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466];
+  const ids= right? eyeR:eyeL; const pts=ids.map(i=>({x:lm[i].x*W, y:lm[i].y*H}));
+  let cx=0,cy=0; for(const p of pts){ cx+=p.x; cy+=p.y; } cx/=pts.length; cy/=pts.length;
+  let sxx=0,syy=0,sxy=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy; }
+  sxx/=pts.length; syy/=pts.length; sxy/=pts.length;
+  const T=sxx+syy, D=sxx*syy - sxy*sxy, disc=Math.max(0,T*T/4 - D);
+  const l1=T/2 + Math.sqrt(disc); let vx1= l1 - syy, vy1 = sxy; const n=Math.hypot(vx1,vy1)||1; vx1/=n; vy1/=n;
+  let a=0,b=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; const t1=Math.abs(dx*vx1 + dy*vy1); const t2=Math.abs(-dx*vy1 + dy*vx1); if(t1>a) a=t1; if(t2>b) b=t2; }
+  a*=scale; b*=scale; const theta=Math.atan2(vy1,vx1); return {cx,cy,a,b,theta};
+}
+function onResults(res){
+  if(!running) return;
+  const W=overlay.width, H=overlay.height;
+  ctx.save();
+  if (selectedFacingMode()==="user"){ ctx.translate(W,0); ctx.scale(-1,1); }
+  ctx.drawImage(res.image,0,0,W,H);
+  roiEllipse=null;
+  if(res.multiFaceLandmarks && res.multiFaceLandmarks.length>0){
+    haveFace=true; lastFaceTs=performance.now();
+    const lm = res.multiFaceLandmarks[0];
+    roiEllipse = fitEyeEllipse(lm, W, H, rightEye, 1.15);
+    drawEllipse(roiEllipse);
+    detStatus.textContent='Face OK (auto ROI)';
+  } else {
+    haveFace=false;
+    drawFallback();
+    detStatus.textContent = manualEllipse ? 'Manual ROI' : 'No face (fallback)';
+  }
+  ctx.restore();
+  computeAndUpdate();
+}
+
+/* Manual ROI: tap to place ellipse if FaceMesh is failing */
+overlay.addEventListener('click', (e)=>{
+  const rect = overlay.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (overlay.width/rect.width);
+  const y = (e.clientY - rect.top)  * (overlay.height/rect.height);
+  // create a reasonable ellipse around tap (w~eye width)
+  const a = overlay.width * 0.06, b = overlay.height * 0.03;
+  manualEllipse = {cx:x, cy:y, a:a, b:b, theta:0};
+  detStatus.textContent='Manual ROI';
+});
+
+/* Camera */
+async function startCamera(){
+  const mode=selectedFacingMode();
+  const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:mode},width:{ideal:1280},height:{ideal:720}},audio:false});
+  video.srcObject=stream;
+  await new Promise(res=> video.onloadedmetadata=()=>{ video.play(); setAspectFromVideo(); res(); });
+}
+function stopCamera(){ const s=video.srcObject; if(s) s.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
+
+/* Metrics + signals */
 function toGraySmall(imageData,w,h,outW=160,outH=120){
   const gray=new Uint8ClampedArray(outW*outH), d=imageData.data;
   for(let j=0;j<outH;j++){ const y=Math.floor(j*h/outH);
@@ -169,107 +243,30 @@ function varianceOfLaplacian(gray,w,h){
   if(n<2) return 0; const m=s/n; return ss/n - m*m;
 }
 function normalizedMADDiff(prev,curr){ let sa=0, sc=0, n=curr.length; for(let i=0;i<n;i++){ sa+=Math.abs(curr[i]-prev[i]); sc+=curr[i]; } const mi=Math.max(1,sc/n); return (sa/n)/mi; }
-function pointInEllipse(x,y,el){ // (x',y') in rotated frame
-  const ct=Math.cos(el.theta), st=Math.sin(el.theta);
-  const dx=x-el.cx, dy=y-el.cy;
-  const xp= ct*dx + st*dy, yp= -st*dx + ct*dy;
-  return (xp*xp)/(el.a*el.a) + (yp*yp)/(el.b*el.b) <= 1.0;
-}
-function ellipseBBox(el){
-  // Conservative bbox from axes (rotation-aware approximation)
-  const ct=Math.cos(el.theta), st=Math.sin(el.theta);
-  const wx=Math.hypot(el.a*ct, el.b*st);
-  const wy=Math.hypot(el.a*st, el.b*ct);
-  return {minX:el.cx-wx, maxX:el.cx+wx, minY:el.cy-wy, maxY:el.cy+wy};
-}
-function ellipseArea(el){ return Math.PI*el.a*el.b; }
-function drawEllipse(el, stroke='rgba(255,230,0,0.95)', fill='rgba(255,230,0,0.15)'){
-  if(!el) return;
-  ctx.save();
-  ctx.translate(el.cx, el.cy);
-  ctx.rotate(el.theta);
-  ctx.beginPath();
-  ctx.ellipse(0,0, el.a, el.b, 0, 0, Math.PI*2);
-  ctx.fillStyle=fill; ctx.strokeStyle=stroke; ctx.lineWidth=2;
-  ctx.fill(); ctx.stroke();
-  ctx.restore();
-}
-function drawFallbackBand(W,H){
-  const y0=H*0.45, y1=y0+Math.max(8,H*0.03), x0=W*0.30, x1=W*0.70;
-  ctx.save();
-  ctx.setLineDash([8,6]); ctx.strokeStyle='rgba(0,220,255,0.95)'; ctx.lineWidth=2;
-  ctx.strokeRect(x0,y0, x1-x0, y1-y0);
-  ctx.restore();
-}
 
-/* Eye ellipse fit (single eye) */
-function fitEyeEllipse(lm,W,H,right=true,scale=1.15){
-  const eyeR=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
-  const eyeL=[263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466];
-  const ids = right? eyeR : eyeL;
-  const pts = ids.map(i=>({x:lm[i].x*W, y:lm[i].y*H}));
-  let cx=0, cy=0; for(const p of pts){ cx+=p.x; cy+=p.y; } cx/=pts.length; cy/=pts.length;
-  let sxx=0,syy=0,sxy=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; sxx+=dx*dx; syy+=dy*dy; sxy+=dx*dy; }
-  sxx/=pts.length; syy/=pts.length; sxy/=pts.length;
-  const T=sxx+syy, D=sxx*syy - sxy*sxy, disc=Math.max(0, T*T/4 - D);
-  const l1=T/2 + Math.sqrt(disc), l2=T/2 - Math.sqrt(disc);
-  let vx1,vy1; if(Math.abs(sxy)>1e-6){ vx1=l1-syy; vy1=sxy; const n=Math.hypot(vx1,vy1)||1; vx1/=n; vy1/=n; } else { vx1=1; vy1=0; }
-  let a=0,b=0; for(const p of pts){ const dx=p.x-cx, dy=p.y-cy; const t1=Math.abs(dx*vx1 + dy*vy1); const t2=Math.abs(-dx*vy1 + dy*vx1); if(t1>a) a=t1; if(t2>b) b=t2; }
-  a*=scale; b*=scale;
-  const theta=Math.atan2(vy1, vx1);
-  return {cx,cy,a,b,theta};
-}
-
-/* MediaPipe */
-let rightEye=true;
-async function initFaceMesh(){
-  faceMesh=new FaceMesh.FaceMesh({locateFile:(f)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
-  faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
-  faceMesh.onResults(onResults); faceMeshReady=true; logDebug('FaceMesh initialized.');
-}
-
-/* Camera */
-async function startCamera(){
-  try{
-    const mode=selectedFacingMode();
-    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:mode},width:{ideal:1280},height:{ideal:720}},audio:false});
-    video.srcObject=stream;
-    await new Promise(res=> video.onloadedmetadata=()=>{ video.play(); setCanvasAspectFromVideo(); res(); });
-  }catch(e){ logDebug('Camera error: '+e.message,true); throw e; }
-}
-function stopCamera(){ const s=video.srcObject; if(s) s.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
-
-/* Image ops (mask, vesselness, etc.) */
-function conjunctivaMask(imageData, el){
+function meanRGBEllipse(imageData, el){
   const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
-  const x0=Math.max(0,Math.floor(bb.minX)), x1=Math.min(W-1,Math.ceil(bb.maxX));
-  const y0=Math.max(0,Math.floor(bb.minY)), y1=Math.min(H-1,Math.ceil(bb.maxY));
-  const outW=x1-x0+1, outH=y1-y0+1, mask=new Uint8Array(outW*outH);
-  for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
-    if(!pointInEllipse(x,y,el)) continue;
-    const idx=(y*W+x)*4, r=data[idx], g=data[idx+1], b=data[idx+2];
-    const V=Math.max(r,g,b), S= V? (V - Math.min(r,g,b))/V : 0;
-    const isSclera=(V>240 && S<0.12), isLash=(V<35);
-    const looksConj=(!isSclera && !isLash && r>=g && g>=b && S>=0.10 && S<=0.65 && V>=50 && V<=230);
-    mask[(y-y0)*outW+(x-x0)] = looksConj?1:0;
+  const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(W-1,Math.ceil(bb.maxX));
+  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(H-1,Math.ceil(bb.maxY));
+  let sr=0,sg=0,sb=0,n=0;
+  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+    if(!pointInEllipse(x,y,el)) continue; const idx=(y*W+x)*4; sr+=data[idx]; sg+=data[idx+1]; sb+=data[idx+2]; n++;
   }
-  return {mask,x0,y0,w:outW,h:outH};
+  return n? {r:sr/n,g:sg/n,b:sb/n,n} : {r:0,g:0,b:0,n:0};
 }
-function extractGreenConj(imageData, el, outW=240, outH=160){
+function glareFracEllipse(imageData, el){
   const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
-  const x0=Math.max(0,Math.floor(bb.minX)), x1=Math.min(W-1,Math.ceil(bb.maxX));
-  const y0=Math.max(0,Math.floor(bb.minY)), y1=Math.min(H-1,Math.ceil(bb.maxY));
-  const roiW=x1-x0+1, roiH=y1-y0+1;
-  const m=conjunctivaMask(imageData, el);
-  const g=new Float32Array(outW*outH), mask=new Uint8Array(outW*outH);
-  for(let j=0;j<outH;j++){ const sy=y0 + Math.floor(j*roiH/outH);
-    for(let i=0;i<outW;i++){ const sx=x0 + Math.floor(i*roiW/outW); const idx=(sy*W+sx)*4;
-      const mVal=(sx>=m.x0 && sx<m.x0+m.w && sy>=m.y0 && sy<m.y0+m.h) ? m.mask[(sy-m.y0)*m.w + (sx-m.x0)] : 0;
-      mask[j*outW+i]=mVal?1:0; g[j*outW+i]=mVal? data[idx+1] : 0;
-    }
+  const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(W-1,Math.ceil(bb.maxX));
+  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(H-1,Math.ceil(bb.maxY));
+  let cnt=0, br=0;
+  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
+    if(!pointInEllipse(x,y,el)) continue; const idx=(y*W+x)*4;
+    const Y=0.299*data[idx]+0.587*data[idx+1]+0.114*data[idx+2]; cnt++; if(Y>=245) br++;
   }
-  return {g,w:outW,h:outH,mask};
+  return cnt? br/cnt : 1.0;
 }
+
+/* Mask + vesselness */
 function boxBlur(gray,w,h,r=3){ const tmp=new Float32Array(w*h), out=new Float32Array(w*h);
   for(let y=0;y<h;y++){ let sum=0; for(let x=0;x<w;x++){ const x0=Math.max(0,x-r), x1=Math.min(w-1,x+r);
     if(x===0){ sum=0; for(let i=x0;i<=x1;i++) sum+=gray[y*w+i]; } else { const prev=Math.max(0,x-1-r), next=Math.min(w-1,x+r); sum += gray[y*w+next]-gray[y*w+prev]; }
@@ -277,6 +274,63 @@ function boxBlur(gray,w,h,r=3){ const tmp=new Float32Array(w*h), out=new Float32
   for(let x=0;x<w;x++){ let sum=0; for(let y=0;y<h;y++){ const y0=Math.max(0,y-r), y1=Math.min(h-1,y+r);
     if(y===0){ sum=0; for(let j=y0;j<=y1;j++) sum+=tmp[j*w+x]; } else { const prev=Math.max(0,y-1-r), next=Math.min(h-1,y+r); sum += tmp[next*w+x]-tmp[prev*w+x]; }
     out[y*w+x]=sum/(y1-y0+1); } } return out;
+}
+function conjMask(imageData, el, relax=0){
+  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
+  const x0=Math.max(0,Math.floor(bb.minX)), x1=Math.min(W-1,Math.ceil(bb.maxX));
+  const y0=Math.max(0,Math.floor(bb.minY)), y1=Math.min(H-1,Math.ceil(bb.maxY));
+  const w=x1-x0+1, h=y1-y0+1, mask=new Uint8Array(w*h);
+  const sclHi = 240 - relax*10, lashLo = 35 - relax*5;
+  for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
+    if(!pointInEllipse(x,y,el)) continue;
+    const idx=(y*W+x)*4, r=data[idx], g=data[idx+1], b=data[idx+2];
+    const V=Math.max(r,g,b), S= V? (V - Math.min(r,g,b))/V : 0;
+    const isSclera=(V>sclHi && S<0.12), isLash=(V<lashLo);
+    const looksConj=(!isSclera && !isLash && r>=g && g>=b && S>=0.08 && S<=0.7 && V>=40 && V<=235);
+    mask[(y-y0)*w+(x-x0)] = looksConj?1:0;
+  }
+  return {mask,x0,y0,w,h};
+}
+function extractCrops(imageData, el, outW=240, outH=160){
+  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
+  const x0=Math.max(0,Math.floor(bb.minX)), x1=Math.min(W-1,Math.ceil(bb.maxX));
+  const y0=Math.max(0,Math.floor(bb.minY)), y1=Math.min(H-1,Math.ceil(bb.maxY));
+  const roiW=x1-x0+1, roiH=y1-y0+1;
+
+  let relax=0, m=conjMask(imageData, el, relax);
+  // If too sparse, relax thresholds up to 3 steps
+  for(let tries=0; tries<3; tries++){
+    const filled = m.mask.reduce((a,v)=>a+v,0);
+    if (filled > (roiW*roiH*0.01)) break;
+    relax++; m=conjMask(imageData, el, relax);
+  }
+
+  // Unmasked RGB crop for clarity
+  const rgbImg=unmaskCtx.createImageData(outW,outH);
+  for(let j=0;j<outH;j++){
+    const sy=y0 + Math.floor(j*roiH/outH);
+    for(let i=0;i<outW;i++){
+      const sx=x0 + Math.floor(i*roiW/outW);
+      const idxSrc=(sy*W+sx)*4, idxDst=(j*outW+i)*4;
+      rgbImg.data[idxDst+0]=data[idxSrc+0];
+      rgbImg.data[idxDst+1]=data[idxSrc+1];
+      rgbImg.data[idxDst+2]=data[idxSrc+2];
+      rgbImg.data[idxDst+3]=255;
+    }
+  }
+
+  // Masked green + vesselness
+  const g=new Float32Array(outW*outH), mask=new Uint8Array(outW*outH);
+  for(let j=0;j<outH;j++){
+    const sy=y0 + Math.floor(j*roiH/outH);
+    for(let i=0;i<outW;i++){
+      const sx=x0 + Math.floor(i*roiW/outW);
+      const idx=(sy*W+sx)*4, dst=j*outW+i;
+      const mVal=(sx>=m.x0 && sx<m.x0+m.w && sy>=m.y0 && sy<m.y0+m.h) ? m.mask[(sy-m.y0)*m.w + (sx-m.x0)] : 0;
+      mask[dst]=mVal?1:0; g[dst]=mVal? data[idx+1]:0;
+    }
+  }
+  return {rgbImg,g,mask,w:outW,h:outH};
 }
 function vesselnessTopHatMasked(g,w,h,mask,blurR=3){
   const blurred=boxBlur(g,w,h,blurR); const raw=new Float32Array(w*h); let maxv=1e-6;
@@ -313,37 +367,21 @@ function analyzeRppg(times, vals){
   return {hr, acdc: acdc? acdc.toFixed(4):null, snr};
 }
 
-/* Frame processing */
-function onResults(res){
-  if(!running) return;
-  ctx.save();
-  if(selectedFacingMode()==="user"){ ctx.translate(overlay.width,0); ctx.scale(-1,1); }
-  ctx.drawImage(res.image,0,0,overlay.width,overlay.height);
-  roiEllipse=null;
-  if(res.multiFaceLandmarks && res.multiFaceLandmarks.length>0){
-    const lm = res.multiFaceLandmarks[0];
-    roiEllipse = fitEyeEllipse(lm, overlay.width, overlay.height, rightEye, 1.15);
-    drawEllipse(roiEllipse);
-  } else {
-    drawFallbackBand(overlay.width, overlay.height);
-  }
-  ctx.restore();
-  computeMetricsAndUpdateUI();
-}
-
-function computeMetricsAndUpdateUI(){
-  const frame=ctx.getImageData(0,0,overlay.width,overlay.height);
-  const {gray,outW,outH}=toGraySmall(frame,overlay.width,overlay.height);
+/* Per-frame compute + UI */
+let greenSeries=[], sampleTimes=[];
+function computeAndUpdate(){
+  const W=overlay.width, H=overlay.height;
+  const el = roiEllipse || manualEllipse;
+  // draw landmarks/fallback already done; now metrics
+  const frame=ctx.getImageData(0,0,W,H);
+  const {gray,outW,outH}=toGraySmall(frame,W,H);
   const varLap=varianceOfLaplacian(gray,outW,outH);
-  const motion=lastGraySmall? normalizedMADDiff(lastGraySmall,gray):0; lastGraySmall=gray;
+  const motion= lastGraySmall? normalizedMADDiff(lastGraySmall,gray):0; lastGraySmall=gray;
 
   let glare=1.0, rgb={r:0,g:0,b:0,n:0}, roiFrac=0;
-  if(roiEllipse){
-    // simple approximated coverage from bbox area
-    const bb=ellipseBBox(roiEllipse);
-    glare = glareFractionEllipse(frame, roiEllipse);
-    rgb = meanRGBEllipse(frame, roiEllipse);
-    roiFrac = ((bb.maxX-bb.minX)*(bb.maxY-bb.minY))/(overlay.width*overlay.height);
+  if(el){
+    const bb=ellipseBBox(el); glare=glareFracEllipse(frame, el); rgb=meanRGBEllipse(frame, el);
+    roiFrac=((bb.maxX-bb.minX)*(bb.maxY-bb.minY))/(W*H);
   }
 
   if(rgb.n>0){ pR.textContent=rgb.r.toFixed(0); pG.textContent=rgb.g.toFixed(0); pB.textContent=rgb.b.toFixed(0); pRG.textContent=(rgb.g>0?(rgb.r/rgb.g).toFixed(3):"—"); }
@@ -353,121 +391,101 @@ function computeMetricsAndUpdateUI(){
   mMotion.textContent=motion.toFixed(3); setClass(mMotion,motionOk);
   mGlare.textContent=(glare*100).toFixed(1)+"%"; setClass(mGlare,glareOk);
   mRoi.textContent=(roiFrac*100).toFixed(2)+"%"; setClass(mRoi,roiOk);
-  mStatus.textContent= focusOk&&motionOk&&glareOk&&roiOk ? "PASS":"Adjust aim / light / stability"; setClass(mStatus, focusOk&&motionOk&&glareOk&&roiOk);
+  const pass = focusOk && motionOk && glareOk && roiOk && !!el;
+  mStatus.textContent = pass? "PASS" : (el? "Adjust aim/light/stability" : "Set ROI (auto or tap)");
+  setClass(mStatus, pass);
 
-  const now=performance.now()/1000;
-  if(rgb.n>0){
-    greenSeries.push(rgb.g); sampleTimes.push(now);
+  // rPPG green
+  if(rgb.n>0){ const t=performance.now()/1000; greenSeries.push(rgb.g); sampleTimes.push(t);
     if(greenSeries.length>MAX_SERIES){ greenSeries.splice(0,greenSeries.length-MAX_SERIES); sampleTimes.splice(0,sampleTimes.length-MAX_SERIES); }
     plotSeries(greenSeries);
   }
 
-  // Aiming crop (contain, no stretch)
-  if(roiEllipse){
-    const bb=ellipseBBox(roiEllipse);
+  // Aiming crop: draw from VIDEO (not overlay) to avoid black
+  if(el){
+    const bb=ellipseBBox(el); // padded crop
     const padX=Math.max(8,(bb.maxX-bb.minX)*0.35), padY=Math.max(8,(bb.maxY-bb.minY)*0.8);
-    const sx=Math.max(0,Math.floor(bb.minX-padX)), sy=Math.max(0,Math.floor(bb.minY-padY));
-    const sw=Math.min(overlay.width-1,Math.ceil(bb.maxX+padX))-sx+1;
-    const sh=Math.min(overlay.height-1,Math.ceil(bb.maxY+padY))-sy+1;
-    const S=Math.min(aimCanvas.width/sw, aimCanvas.height/sh);
-    const dw=sw*S, dh=sh*S, dx=(aimCanvas.width-dw)/2, dy=(aimCanvas.height-dh)/2;
+    let sx=Math.max(0,Math.floor(bb.minX-padX)), sy=Math.max(0,Math.floor(bb.minY-padY));
+    let sw=Math.min(W-1,Math.ceil(bb.maxX+padX))-sx+1, sh=Math.min(H-1,Math.ceil(bb.maxY+padY))-sy+1;
+    // mirror if selfie
     aimCtx.save(); aimCtx.clearRect(0,0,aimCanvas.width,aimCanvas.height);
     if(selectedFacingMode()==="user"){ aimCtx.translate(aimCanvas.width,0); aimCtx.scale(-1,1); }
-    aimCtx.drawImage(overlay, sx,sy,sw,sh, dx,dy,dw,dh);
+    // drawImage(video,...)
+    const S=Math.min(aimCanvas.width/sw, aimCanvas.height/sh), dw=sw*S, dh=sh*S, dx=(aimCanvas.width-dw)/2, dy=(aimCanvas.height-dh)/2;
+    aimCtx.drawImage(video, sx,sy,sw,sh, dx,dy,dw,dh);
     aimCtx.restore();
+  } else {
+    aimCtx.clearRect(0,0,aimCanvas.width,aimCanvas.height);
   }
-}
-
-/* Mean/glare over ellipse (pixel-accurate) */
-function meanRGBEllipse(imageData, el){
-  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
-  const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(W-1,Math.ceil(bb.maxX));
-  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(H-1,Math.ceil(bb.maxY));
-  let sr=0,sg=0,sb=0,n=0;
-  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
-    if(!pointInEllipse(x,y,el)) continue; const idx=(y*W+x)*4; sr+=data[idx]; sg+=data[idx+1]; sb+=data[idx+2]; n++;
-  }
-  return n? {r:sr/n,g:sg/n,b:sb/n,n} : {r:0,g:0,b:0,n:0};
-}
-function glareFractionEllipse(imageData, el){
-  const {width:W,height:H,data}=imageData, bb=ellipseBBox(el);
-  const minX=Math.max(0,Math.floor(bb.minX)), maxX=Math.min(W-1,Math.ceil(bb.maxX));
-  const minY=Math.max(0,Math.floor(bb.minY)), maxY=Math.min(H-1,Math.ceil(bb.maxY));
-  let cnt=0, br=0;
-  for(let y=minY;y<=maxY;y++) for(let x=minX;x<=maxX;x++){
-    if(!pointInEllipse(x,y,el)) continue; const idx=(y*W+x)*4;
-    const Y=0.299*data[idx]+0.587*data[idx+1]+0.114*data[idx+2]; cnt++; if(Y>=245) br++;
-  }
-  return cnt? br/cnt : 1.0;
 }
 
 /* Loop */
 async function loop(){
   if(!running) return;
   try{
-    if(faceMeshReady){ await faceMesh.send({image:video}); }
-    else{
-      ctx.drawImage(video,0,0,overlay.width,overlay.height);
-      drawFallbackBand(overlay.width,overlay.height);
-      computeMetricsAndUpdateUI();
+    if(faceMeshReady){
+      await faceMesh.send({image:video});
+    } else {
+      const W=overlay.width,H=overlay.height;
+      ctx.save(); if (selectedFacingMode()==="user"){ ctx.translate(W,0); ctx.scale(-1,1); }
+      ctx.drawImage(video,0,0,W,H); drawFallback(); ctx.restore();
+      computeAndUpdate();
     }
   }catch(e){ logDebug('Loop error: '+e.message,true); }
   requestAnimationFrame(loop);
 }
 
-/* Record / Analyze */
-function startRecording(){
-  if(!running||recording) return;
-  recording=true; recordStart=performance.now()/1000; ui.btnRecord.disabled=true;
-  vesselSum=null; vesselCount=0; roiCtx.clearRect(0,0,roiCanvas.width,roiCanvas.height); vesselCtx.clearRect(0,0,vesselCanvas.width,vesselCanvas.height);
-  let left=10.0; ui.recStatus.textContent=`Recording: ${left.toFixed(1)}s`;
-  recTimer=setInterval(()=>{ left=Math.max(0,10-(performance.now()/1000-recordStart)); ui.recStatus.textContent=`Recording: ${left.toFixed(1)}s`; if(left<=0) stopRecordingAndAnalyze(); },100);
-}
-function cancelCountdown(){ if(recTimer){ clearInterval(recTimer); recTimer=null; } }
-function stopRecordingAndAnalyze(){
-  cancelCountdown(); recording=false; ui.recStatus.textContent="Analyzing…";
-  const now=sampleTimes.length? sampleTimes[sampleTimes.length-1]:0;
-  const idx=sampleTimes.findIndex(t=>t>=now-10);
-  const times= idx>=0? sampleTimes.slice(idx): sampleTimes.slice();
-  const vals = idx>=0? greenSeries.slice(idx): greenSeries.slice();
-  const res=analyzeRppg(times,vals);
-  rHR.textContent = res.hr? res.hr.toString():"—";
-  rACDC.textContent = res.acdc? res.acdc:"—";
-  rSNR.textContent = res.snr? res.snr:"—";
+/* Record + analyze */
+btnRecord.onclick = ()=>{
+  const el = roiEllipse || manualEllipse;
+  if(!running || !el) { recStatus.textContent='Set ROI first'; return; }
+  recStatus.textContent='Recording: 10.0s'; btnRecord.disabled=true;
+  const t0=performance.now();
+  const timer=setInterval(()=>{
+    const dt=(performance.now()-t0)/1000; const left=Math.max(0,10-dt); recStatus.textContent=`Recording: ${left.toFixed(1)}s`;
+    if(left<=0){ clearInterval(timer);
+      // analyze last 10s
+      const now=sampleTimes.length? sampleTimes[sampleTimes.length-1]:0;
+      const idx=sampleTimes.findIndex(t=>t>=now-10);
+      const times= idx>=0? sampleTimes.slice(idx): sampleTimes.slice();
+      const vals = idx>=0? greenSeries.slice(idx): greenSeries.slice();
+      const res=analyzeRppg(times,vals);
+      rHR.textContent = res.hr? res.hr.toString():"—";
+      rACDC.textContent = res.acdc? res.acdc:"—";
+      rSNR.textContent = res.snr? res.snr:"—";
 
-  if(roiEllipse){
-    const frame=ctx.getImageData(0,0,overlay.width,overlay.height);
-    const crop=extractGreenConj(frame,roiEllipse,roiCanvas.width,roiCanvas.height);
-    const enh=vesselnessTopHatMasked(crop.g,crop.w,crop.h,crop.mask,3);
-    // show masked ROI
-    const roiImg=roiCtx.createImageData(crop.w,crop.h);
-    for(let i=0;i<crop.w*crop.h;i++){ const v=crop.mask[i]? Math.round(crop.g[i]):0; roiImg.data[4*i+0]=v; roiImg.data[4*i+1]=v; roiImg.data[4*i+2]=v; roiImg.data[4*i+3]=255; }
-    roiCtx.putImageData(roiImg,0,0);
-    // show vesselness normalized
-    let maxv=1; for(let i=0;i<enh.length;i++) if(enh[i]>maxv) maxv=enh[i];
-    const vs=vesselCtx.createImageData(crop.w,crop.h);
-    for(let i=0;i<enh.length;i++){ const vv=Math.round(255*enh[i]/maxv); vs.data[4*i+0]=vv*0.6; vs.data[4*i+1]=vv; vs.data[4*i+2]=vv*0.8; vs.data[4*i+3]=255; }
-    vesselCtx.putImageData(vs,0,0);
-  }
-  ui.recStatus.textContent="Done"; ui.btnRecord.disabled=false;
-}
+      // crops + vessel
+      const frame=ctx.getImageData(0,0,overlay.width,overlay.height);
+      const crops = extractCrops(frame, el, roiUnmasked.width, roiUnmasked.height);
+      unmaskCtx.putImageData(crops.rgbImg,0,0);
+      const enh=vesselnessTopHatMasked(crops.g,crops.w,crops.h,crops.mask,3);
+      const vis=vesselCtx.createImageData(crops.w,crops.h);
+      let maxv=1; for(let i=0;i<enh.length;i++) if(enh[i]>maxv) maxv=enh[i];
+      for(let i=0;i<enh.length;i++){ const vv=Math.round(255*enh[i]/maxv); vis.data[4*i+0]=vv*0.6; vis.data[4*i+1]=vv; vis.data[4*i+2]=vv*0.8; vis.data[4*i+3]=255;
+        // overlay mask edge (optional)
+        if(!crops.mask[i]){ vis.data[4*i+0]*=0.2; vis.data[4*i+1]*=0.2; vis.data[4*i+2]*=0.2; }
+      }
+      vesselCtx.putImageData(vis,0,0);
+
+      recStatus.textContent='Done'; btnRecord.disabled=false;
+    }
+  },100);
+};
 
 /* Controls */
-async function start(){
-  ui.btnRecord.disabled=true; logDebug('Starting camera…');
-  await startCamera(); setCanvasAspectFromVideo();
-  logDebug('Initializing FaceMesh…'); try{ await initFaceMesh(); }catch(e){ logDebug('FaceMesh init error: '+e.message,true); }
-  running=true; ui.recStatus.textContent='Live'; ui.btnRecord.disabled=false; loop();
-}
-function stop(){ running=false; stopCamera(); cancelCountdown(); ui.recStatus.textContent='Idle'; logDebug('Stopped.'); }
-
-btnStart.onclick=async()=>{ if(!running) await start(); };
-btnStop.onclick =()=> stop();
-btnRecord.onclick=()=> startRecording();
-ui.eyeSide.onchange = ()=>{ rightEye = ui.eyeSide.checked; };
+btnStart.onclick = async ()=>{
+  if(running) return;
+  try{
+    await startCamera(); setAspectFromVideo();
+    await initFaceMesh();
+    running=true; recStatus.textContent='Live'; loop();
+  }catch(e){ logDebug('Camera init error: '+e.message,true); }
+};
+btnStop.onclick = ()=>{ running=false; stopCamera(); recStatus.textContent='Idle'; };
+eyeSide.onchange = ()=>{ rightEye = eyeSide.checked; roiEllipse=null; };
 
 /* Guards */
-window.addEventListener('error',e=>logDebug('JS error: '+e.message,true));
+window.addEventListener('error', e=>logDebug('JS error: '+e.message,true));
 if(!('mediaDevices' in navigator)) logDebug('Error: mediaDevices not available (use Safari over HTTPS).',true);
 </script>
 </body>
